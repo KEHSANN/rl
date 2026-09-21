@@ -1,0 +1,126 @@
+# contact-rl
+#
+# Implementation of "Learning to Act Through Contact: A Unified View of
+# Multi-Task Robot Learning" (Omar & Khadiv, arXiv:2510.03599v2) on top of mjlab.
+#
+# This project is a **uv workspace root**. mjlab (vendored under ``.mjlab_ref``)
+# is a workspace member, referenced via ``mjlab = { workspace = true }``. Because
+# uv reads resolver-wide settings (``conflicts``, ``environments``) and index
+# definitions only from the workspace root, mjlab's index / source configuration
+# (NVIDIA warp, PyTorch CUDA) is mirrored below. If mjlab's own pinning changes,
+# update the mirrored entries here to match. Two upstream choices are
+# deliberately *not* mirrored -- the ``mujoco-warp`` git rev and mjlab's torch
+# extras; see the notes on ``[tool.uv.sources]`` and ``conflicts`` below.
+
+[project]
+name = "contact-rl"
+version = "0.1.0"
+description = "Contact-explicit multi-task robot learning (arXiv:2510.03599v2) on mjlab."
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+  "mjlab",
+  # Pinned to the exact release the git rev mjlab uses builds to; it pairs with
+  # the MuJoCo 3.5.x bindings, so keep mujoco in that series. Taking it from
+  # PyPI rather than git is load-bearing -- see the sources note below.
+  "mujoco-warp==3.5.0.2",
+  "mujoco>=3.5.0,<3.6",
+]
+
+[project.optional-dependencies]
+# Mirror mjlab's torch extras so `uv sync --extra cu128` / `--extra cpu` works.
+cu128 = ["torch>=2.7.0"]
+cpu = ["torch>=2.7.0"]
+
+[project.scripts]
+# Thin wrappers that register the contact tasks before delegating to mjlab's
+# train / play CLIs (see src/contact_rl/scripts/).
+contact-train = "contact_rl.scripts.train:main"
+contact-play = "contact_rl.scripts.play:main"
+
+[build-system]
+requires = ["uv_build>=0.8.19,<0.9.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "contact_rl"
+module-root = "src"
+
+[tool.uv.workspace]
+members = [".mjlab_ref"]
+
+[tool.uv.sources]
+mjlab = { workspace = true }
+# --- Mirrored from .mjlab_ref/pyproject.toml (workspace root owns these). ---
+warp-lang = { index = "nvidia", marker = "sys_platform != 'darwin'" }
+torch = [
+  { index = "pytorch-cu128", extra = "cu128", marker = "sys_platform != 'darwin'" },
+  { index = "pytorch-cpu", extra = "cpu", marker = "sys_platform != 'darwin'" },
+]
+mujoco = { index = "pypi" }
+# NOTE: mjlab upstream takes mujoco-warp from a git rev. Do not restore that --
+# verified against uv 0.9.14:
+#
+#   * uv honours a *git* dependency's own ``[tool.uv.sources]``. mujoco_warp's
+#     pyproject.toml declares ``mujoco = { index = "mujoco" }`` pointing at
+#     py.mujoco.org, which serves only .dev nightlies (oldest listed:
+#     3.10.1.dev939631378) and no PEP 658 metadata. With the git rev in place,
+#     ``mujoco>=3.5.0,<3.6`` is therefore unsatisfiable ("only
+#     mujoco>=3.10.1.dev939631378 is available"), and before the ``environments``
+#     narrowing it 403'd on a macOS wheel missing from the bucket.
+#   * The pin above does *not* override it: uv reports "conflicting indexes for
+#     package mujoco" instead. There is no root-level escape hatch.
+#   * That same rev is published as ``mujoco-warp==3.5.0.2`` on PyPI, with
+#     identical requirements (absl-py, etils[epath], mujoco>=3.5.0, numpy,
+#     warp-lang>=1.11.0) as a pure-python py3-none-any wheel. PyPI serves only
+#     ``Requires-Dist``, never ``tool.uv.sources``, so the py.mujoco.org pin
+#     disappears -- and the server needs neither git nor a source build.
+#
+# The explicit ``mujoco = { index = "pypi" }`` pin is belt-and-braces: if the git
+# source is ever restored, uv fails loudly on conflicting indexes rather than
+# silently resolving nightlies.
+
+[tool.uv]
+# NOTE: .mjlab_ref's own ``cu128`` / ``cpu`` extras were removed rather than
+# mirrored here. ``conflicts`` only forbids combinations *within* one group, and
+# a group cannot span the two packages usefully: with extras on both, uv splits
+# the resolution 9 ways (contact-rl x mjlab, each cu128/cpu/neither) and
+# cross-splits such as contact-rl[cu128] + mjlab[cpu] activate both torch
+# indexes -> "conflicting indexes for package torch". One extra dimension only.
+conflicts = [
+  [{ extra = "cu128" }, { extra = "cpu" }],
+]
+# Deployment target is a single Linux/x86_64 GPU server, so the resolution is
+# narrowed (``environments``) rather than widened (``required-environments``).
+environments = [
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+# Named so ``mujoco`` can be pinned to it by name; not ``explicit``, so it stays
+# the default index for everything else.
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com/"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.ruff]
+src = ["src"]
+indent-width = 2
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B"]
+ignore = ["B011"]

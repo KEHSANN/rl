@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Environments / tooling
+# NOTE: uv.lock is intentionally NOT ignored -- commit it so the server
+# resolves exactly what was tested locally.
+.venv/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Training artefacts
+logs/
+outputs/
+wandb/
+*.pt
+*.onnx
