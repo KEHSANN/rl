@@ -18,6 +18,14 @@ Faithfulness notes:
     auxiliary penalties the paper lists (base angular velocity, joint velocity,
     acceleration, torque, joint deviation, action rate). Reward weights are
     per-second rates (mjlab dt-scales them by ``step_dt``); tune as needed.
+
+Simulation parameters:
+  The MuJoCo / MJWarp settings are **not** written inline here. They come from
+  the named presets in :mod:`contact_rl.sim_presets`, which default to
+  ``baseline`` -- the exact values this task has always used. This keeps
+  performance experiments non-destructive: an optimisation is a preset you opt
+  into, not an edit that silently changes the physics of every future run. See
+  that module for what each parameter does and which ones must never change.
 """
 
 from __future__ import annotations
@@ -35,11 +43,11 @@ from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.scene import SceneCfg
-from mjlab.sim import MujocoCfg, SimulationCfg
 from mjlab.terrains import TerrainEntityCfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 
+from contact_rl.sim_presets import make_sim_cfg
 from contact_rl.tasks.contact import mdp
 
 # Foot order shared by the command term, the contact sensor, and the feet
@@ -50,8 +58,16 @@ COMMAND_NAME = "contact"
 FEET_SENSOR_NAME = "feet_ground_contact"
 
 
-def make_contact_env_cfg() -> ManagerBasedRlEnvCfg:
-  """Create the base contact-explicit locomotion task configuration."""
+def make_contact_env_cfg(sim_preset: str | None = None) -> ManagerBasedRlEnvCfg:
+  """Create the base contact-explicit locomotion task configuration.
+
+  Args:
+    sim_preset: Name of a preset in :mod:`contact_rl.sim_presets`
+      (``baseline`` / ``safe`` / ``optimized``). ``None`` resolves via the
+      ``CONTACT_RL_SIM_PRESET`` environment variable and then falls back to
+      ``baseline``, whose values are identical to the ones this task used
+      before the preset system existed.
+  """
 
   ##
   # Observations.
@@ -332,17 +348,11 @@ def make_contact_env_cfg() -> ManagerBasedRlEnvCfg:
       elevation=-10.0,
       azimuth=90.0,
     ),
-    sim=SimulationCfg(
-      nconmax=None,
-      njmax=300,
-      mujoco=MujocoCfg(
-        timestep=0.005,
-        iterations=10,
-        ls_iterations=20,
-        ccd_iterations=50,
-      ),
-      contact_sensor_maxmatch=64,
-    ),
+    # Every MuJoCo / MJWarp knob lives in contact_rl.sim_presets. The default
+    # ``baseline`` preset is value-identical to the literal this replaced:
+    #   nconmax=None, njmax=300, contact_sensor_maxmatch=64,
+    #   timestep=0.005, iterations=10, ls_iterations=20, ccd_iterations=50.
+    sim=make_sim_cfg(sim_preset),
     decimation=4,  # 50 Hz control.
     episode_length_s=20.0,
   )
