@@ -37,6 +37,10 @@ cpu = ["torch>=2.7.0"]
 # train / play CLIs (see src/contact_rl/scripts/).
 contact-train = "contact_rl.scripts.train:main"
 contact-play = "contact_rl.scripts.play:main"
+# Performance / measurement harness. Self-contained: it builds the env config
+# directly rather than going through mjlab's task registry, so --preset takes
+# effect without depending on import order. See src/contact_rl/scripts/benchmark.py.
+contact-benchmark = "contact_rl.scripts.benchmark:main"
 
 [build-system]
 requires = ["uv_build>=0.8.19,<0.9.0"]
