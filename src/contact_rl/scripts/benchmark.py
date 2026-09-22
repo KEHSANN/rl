@@ -72,7 +72,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
@@ -83,6 +83,8 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("WANDB_MODE", "offline")
 
 TASK_ID = "Mjlab-Contact-Flat-Unitree-Go2"
+# Mirrors ``contact_rl.tasks.contact.mdp.contact_command.GAITS``. Duplicated as a
+# literal so ``--help`` and ``--list-presets`` work without importing torch.
 ALL_GAITS = ("trot", "pace", "bound", "jump", "crawl")
 
 
@@ -327,7 +329,9 @@ def _build_env(cfg: BenchmarkConfig, num_envs: int, gaits: Sequence[str] | None)
 
 def _graph_capture_active(env) -> bool:
   sim = env.unwrapped.sim
-  return bool(getattr(sim, "use_cuda_graph", False) and getattr(sim, "step_graph", None))
+  return bool(
+    getattr(sim, "use_cuda_graph", False) and getattr(sim, "step_graph", None)
+  )
 
 
 ##
@@ -385,13 +389,13 @@ def _measure(
 
     wrapped = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
     tmp_log_dir = tempfile.mkdtemp(prefix="contact_bench_")
-    runner = ContactOnPolicyRunner(
-      wrapped, _asdict(agent_cfg), tmp_log_dir, device
-    )
+    runner = ContactOnPolicyRunner(wrapped, _asdict(agent_cfg), tmp_log_dir, device)
     policy = runner.get_inference_policy(device=device)
 
   gpu = GpuSampler(
-    _physical_gpu_index(torch.cuda.current_device() if device.startswith("cuda") else 0),
+    _physical_gpu_index(
+      torch.cuda.current_device() if device.startswith("cuda") else 0
+    ),
     cfg.gpu_poll_interval,
   )
   cpu = CpuSampler()
@@ -399,7 +403,7 @@ def _measure(
   try:
     if cfg.mode == "train":
       assert runner is not None
-      print(f"[BENCH] warmup: 1 PPO iteration (kernel compile + graph capture)")
+      print("[BENCH] warmup: 1 PPO iteration (kernel compile + graph capture)")
       runner.learn(num_learning_iterations=1, init_at_random_ep_len=True)
       if device.startswith("cuda"):
         torch.cuda.synchronize()
@@ -446,9 +450,7 @@ def _measure(
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
 
-      collector = (
-        SimStatsCollector(env, verbose=True) if cfg.collect_stats else None
-      )
+      collector = SimStatsCollector(env, verbose=True) if cfg.collect_stats else None
 
       print(f"[BENCH] timing: {cfg.steps} steps")
       gpu.start()
@@ -483,12 +485,10 @@ def _measure(
     result["gpu"] = gpu.stop()
     result["cpu"] = cpu.stop()
     if device.startswith("cuda"):
-      result["torch_peak_allocated_mib"] = (
-        torch.cuda.max_memory_allocated() / (1024**2)
+      result["torch_peak_allocated_mib"] = torch.cuda.max_memory_allocated() / (
+        1024**2
       )
-      result["torch_peak_reserved_mib"] = (
-        torch.cuda.max_memory_reserved() / (1024**2)
-      )
+      result["torch_peak_reserved_mib"] = torch.cuda.max_memory_reserved() / (1024**2)
 
   finally:
     gpu.stop()
@@ -722,11 +722,6 @@ def _summarize(payload: dict[str, Any]) -> str:
 ##
 # Comparison.
 ##
-
-
-def _best_throughput(payload: dict[str, Any]) -> float:
-  values = [r.get("env_steps_per_s", 0.0) for r in payload.get("runs", [])]
-  return max(values) if values else 0.0
 
 
 def _mean_throughput(payload: dict[str, Any]) -> float:
