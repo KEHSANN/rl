@@ -17,9 +17,18 @@ from contact_rl.tasks.contact.contact_env_cfg import (
 _FOOT_GEOMS = tuple(f"{name}_foot_collision" for name in FOOT_ORDER)
 
 
-def unitree_go2_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-  """Create the Unitree Go2 flat-terrain contact-explicit configuration."""
-  cfg = make_contact_env_cfg()
+def unitree_go2_flat_env_cfg(
+  play: bool = False, sim_preset: str | None = None
+) -> ManagerBasedRlEnvCfg:
+  """Create the Unitree Go2 flat-terrain contact-explicit configuration.
+
+  Args:
+    play: Use the play/evaluation variant (no corruption, no pushes, endless
+      episodes, 64 envs).
+    sim_preset: Simulation preset name from :mod:`contact_rl.sim_presets`.
+      ``None`` resolves via ``$CONTACT_RL_SIM_PRESET`` and then ``baseline``.
+  """
+  cfg = make_contact_env_cfg(sim_preset=sim_preset)
 
   # Robot entity.
   cfg.scene.entities = {"robot": get_go2_robot_cfg()}
