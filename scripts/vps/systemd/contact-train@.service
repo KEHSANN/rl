@@ -1,0 +1,24 @@
+# Optional systemd *user* unit (alternative to tmux). The instance name is the
+# task id. Edit WorkingDirectory / ExecStart args, then:
+#   mkdir -p ~/.config/systemd/user && cp scripts/vps/systemd/*.service ~/.config/systemd/user/
+#   loginctl enable-linger $USER          # keep user units running after logout
+#   systemctl --user daemon-reload
+#   systemctl --user start contact-train@Mjlab-Contact-Flat-Unitree-Go2
+#   journalctl --user -u contact-train@Mjlab-Contact-Flat-Unitree-Go2 -f
+# `systemctl --user stop` sends SIGTERM -> checkpoint -> clean exit.
+[Unit]
+Description=contact-rl training (%i)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/rl
+Environment=MUJOCO_GL=egl
+Environment=PYOPENGL_PLATFORM=egl
+ExecStart=%h/.local/bin/uv run contact-train %i --env.scene.num-envs 4096
+KillSignal=SIGTERM
+TimeoutStopSec=300
+Restart=no
+
+[Install]
+WantedBy=default.target

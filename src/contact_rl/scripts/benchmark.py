@@ -83,12 +83,17 @@ def bench_one(cfg: BenchConfig, num_envs: int, device: str) -> dict:
 
 
 def main() -> None:
-  import contact_rl  # noqa: F401
+  import contact_rl
+
+  contact_rl.require_tasks()  # registers the tasks (explicit error if broken)
   from mjlab.utils.torch import configure_torch_backends
+
+  from contact_rl.utils.runtime import resolve_device, set_egl_device_for
 
   cfg = tyro.cli(BenchConfig)
   configure_torch_backends()
-  device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+  device = resolve_device(cfg.device)
+  set_egl_device_for(device)
   hardware_report(device)
   print(f"{'num_envs':>9} {'step_ms':>9} {'env-steps/s':>13} {'torch GiB':>10}")
   for n in cfg.num_envs:

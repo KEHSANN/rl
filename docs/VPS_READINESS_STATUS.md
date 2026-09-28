@@ -1,36 +1,15 @@
-# GPU VPS readiness: status (work in progress)
+# GPU VPS readiness: status
 
-This branch is being made production-ready for a headless GPU VPS. **Part 1
-is committed; Parts 2-3 are NOT done yet.** Nothing here has been runtime
-verified (the authoring sandbox had no torch/GPU/simulator).
+Tested in a sandbox WITHOUT torch/mjlab/GPU. 35 unit tests pass there; 7 skip (need torch/tyro/mjlab) and must run on the VPS: `uv run --with pytest pytest tests -q`.
 
-## Done (part 1), VERIFIED BY STATIC ANALYSIS (py_compile) only
+Implemented: runner (EV, entropy coef, iteration time, GPU mem, training/* system/* TB, best.pt, atomic checkpoints, resume at iter+1 into a new run dir, SIGTERM/SIGINT graceful stop, git/version run_info), GRU ONNX wrapper (utils/onnx_compat.py), contact-train/-eval/-watch/-play/-doctor, streaming video, command override wired via apply_to_command_term, GRU reset on dones + manual reset, MUJOCO_GL set in contact_rl/__init__ before mujoco import, scripts/vps.
 
-- `src/contact_rl/utils/runtime.py`: headless EGL selection before mujoco import,
-  SSH-safe console tee, SIGTERM/SIGINT graceful-stop hooks, SIGHUP ignored,
-  git/version/hardware capture, atomic JSON, localhost-only bind guard.
+Not runtime-verified (needs VPS): EGL render, Warp, training start, VRAM at 4096/8192, checkpoint/resume on real runs, watcher+eval on GPU, ONNX export of real GRU, Viser/tunnel/controls, learning behaviour.
 
-## Written but not yet pushed / pending
+Manual step: add `contact-watch` and `contact-doctor` to [project.scripts] in pyproject.toml (see PYPROJECT_SCRIPTS.txt).
 
-- `utils/checkpoints.py` (resolve latest/best/:<it>, atomic save, index.json,
-  retention), `utils/video.py` (streaming ffmpeg MP4 via imageio-ffmpeg, HUD),
-  `mdp/command_override.py` (user commands through the planner).
-- Runner rewrite (explained variance, entropy coef, iteration time, GPU mem,
-  checkpoint TB scalars, checkpoints/ dir, best.pt, fixed GRU ONNX export).
-- `contact-train` rewrite (runs/<exp>/<ts>, resume-from, gpu, video, retention),
-  `contact-watch` async eval/video sidecar, `contact-eval` protocol mode,
-  `contact-play` localhost viser UI with command/checkpoint controls,
-  `contact-doctor`, scripts/vps/*, README section.
-
-## Audit findings to fix in the pending parts
-
-1. rsl-rl 5.0.1 `_OnnxRNNModel` (GRU) returns 3 outputs but declares 2 names:
-   ONNX export of the recurrent policy fails; current runner swallows it.
-2. mjlab train calls `runner.load(path)` without `map_location` (resume across
-   devices) and sets `MUJOCO_GL=egl` after mujoco is imported.
-3. mjlab play binds viser to 0.0.0.0 (unauthenticated) on headless hosts.
-4. mjlab play viewer never resets the GRU hidden state on episode dones.
-5. contact-eval counts the auto-reset transition in contact metrics and treats
-   time-outs as falls.
-6. rsl-rl resume repeats the loaded iteration and overwrites its checkpoint.
-7. mjlab VideoRecorder buffers all frames in RAM.
+## Integration status (part 2)
+VERIFIED (sandbox, no torch/mujoco): 44 unit tests passed (checkpoints, retention, watcher, episode metrics, doctor, video/ffmpeg, runtime, entry points, play GRU proxy); py_compile; bash -n.
+SKIPPED: 7 tests needing torch/tyro/mjlab (CLI --help, command override, ONNX export, rsl-rl GRU, resolve_device), plus tests/test_planning.py.
+NOT RUNTIME VERIFIED: training, resume, TensorBoard, EGL rendering, ONNX export, contact-play, GPU/VRAM checks.
+PERFORMANCE NOT RUNTIME VERIFIED.

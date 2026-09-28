@@ -1,0 +1,18 @@
+# Optional systemd user unit for the watcher (see contact-train@.service).
+[Unit]
+Description=contact-rl checkpoint watcher
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/rl
+Environment=MUJOCO_GL=egl
+Environment=PYOPENGL_PLATFORM=egl
+ExecStart=%h/.local/bin/uv run contact-watch --run latest --interval-s 120
+KillSignal=SIGTERM
+TimeoutStopSec=900
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=default.target

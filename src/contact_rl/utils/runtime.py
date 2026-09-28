@@ -1,8 +1,12 @@
-"""Process-level runtime helpers: headless GL, console tee, signals, run info.
+"""Process-level runtime helpers: headless GL, console tee, signals, run info,
+device selection and GPU memory statistics.
 
 Nothing in this module imports torch / mujoco / mjlab at module level:
 :func:`configure_headless_rendering` has to run *before* ``import mujoco``
 because MuJoCo selects its OpenGL backend from ``MUJOCO_GL`` at import time.
+``contact_rl/__init__.py`` calls it before importing the task package (which
+imports mjlab -> mujoco), so every ``contact-*`` entry point gets the right
+backend no matter which ``contact_rl`` submodule it imports first.
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ TRACKED_DISTRIBUTIONS: tuple[str, ...] = (
   "pillow",
   "onnx",
   "onnxscript",
+  "onnxruntime",
   "PyOpenGL",
   "GitPython",
   "wandb",
@@ -53,13 +58,22 @@ def configure_headless_rendering() -> str:
   """Select a headless OpenGL backend unless the user already chose one.
 
   No DISPLAY and no MUJOCO_GL -> egl. MUJOCO_GL=egl/osmesa implies the same
-  PYOPENGL_PLATFORM. Must be called before ``mujoco`` is imported.
+  PYOPENGL_PLATFORM. Must be called before ``mujoco`` is imported; if mujoco is
+  already imported the backend can no longer change and a warning is printed.
   """
+  already = "mujoco" in sys.modules
+  before = os.environ.get("MUJOCO_GL")
   if "MUJOCO_GL" not in os.environ and not has_display():
     os.environ["MUJOCO_GL"] = "egl"
   backend = os.environ.get("MUJOCO_GL", "").lower()
   if backend in ("egl", "osmesa"):
     os.environ.setdefault("PYOPENGL_PLATFORM", backend)
+  if already and os.environ.get("MUJOCO_GL") != before:
+    print(
+      "[WARN] mujoco was imported before MUJOCO_GL was set; offscreen rendering "
+      "may use the wrong GL backend.",
+      file=sys.stderr,
+    )
   return backend or "default"
 
 
@@ -77,8 +91,63 @@ def assert_private_bind(host: str, allow_public: bool) -> None:
   raise SystemExit(
     f"Refusing to bind the interactive server to '{host}'. It has no "
     "authentication; keep it on 127.0.0.1 and use an SSH tunnel "
-    "(ssh -L 8080:localhost:8080 user@vps)."
+    "(ssh -L 8080:127.0.0.1:8080 user@vps), or pass --allow-public explicitly."
   )
+
+
+def is_loopback(host: str) -> bool:
+  return host in _LOOPBACK_HOSTS
+
+
+def resolve_device(requested: str | None) -> str:
+  """Validate / pick the torch device. Explicit errors instead of silent CPU
+  fallback when a GPU was requested."""
+  import torch
+
+  if requested in (None, "", "auto"):
+    return "cuda:0" if torch.cuda.is_available() else "cpu"
+  req = str(requested)
+  if req == "cpu":
+    return "cpu"
+  if req.startswith("cuda"):
+    if not torch.cuda.is_available():
+      raise SystemExit(
+        f"Device '{req}' requested but torch.cuda.is_available() is False "
+        f"(torch {torch.__version__}, built for CUDA {torch.version.cuda}). "
+        "Run `uv run contact-doctor`."
+      )
+    idx = int(req.split(":", 1)[1]) if ":" in req else 0
+    n = torch.cuda.device_count()
+    if idx >= n:
+      raise SystemExit(f"Device '{req}' requested but only {n} CUDA device(s) visible.")
+    return f"cuda:{idx}"
+  raise SystemExit(f"Unknown device '{req}' (use cpu, cuda or cuda:<index>).")
+
+
+def gpu_memory_stats(device: str) -> dict[str, float]:
+  """Allocated / reserved / peak GiB for a CUDA device, {} on CPU."""
+  if not str(device).startswith("cuda"):
+    return {}
+  try:
+    import torch
+
+    if not torch.cuda.is_available():
+      return {}
+    g = 1024.0**3
+    out = {
+      "allocated_gib": torch.cuda.memory_allocated(device) / g,
+      "reserved_gib": torch.cuda.memory_reserved(device) / g,
+      "max_allocated_gib": torch.cuda.max_memory_allocated(device) / g,
+    }
+    try:
+      free, total = torch.cuda.mem_get_info(device)
+      out["device_used_gib"] = (total - free) / g
+      out["device_total_gib"] = total / g
+    except Exception:
+      pass
+    return out
+  except Exception:
+    return {}
 
 
 class _Tee(io.TextIOBase):
@@ -110,6 +179,9 @@ class _Tee(io.TextIOBase):
   def isatty(self) -> bool:  # type: ignore[override]
     return False
 
+  def fileno(self) -> int:  # type: ignore[override]
+    return self._file.fileno()
+
   @property
   def encoding(self) -> str:  # type: ignore[override]
     return "utf-8"
@@ -123,7 +195,8 @@ def install_console_tee(log_file: Path) -> None:
 
 
 def install_stop_handlers(on_stop: Callable[[str], None]) -> None:
-  """SIGTERM / SIGINT request a graceful stop; SIGHUP is ignored."""
+  """SIGTERM / SIGINT request a graceful stop; a second SIGINT raises
+  KeyboardInterrupt immediately; SIGHUP is ignored (dropped SSH session)."""
 
   def _handler(signum, _frame):
     on_stop(signal.Signals(signum).name)
@@ -202,10 +275,13 @@ def now_iso() -> str:
 
 
 def write_json(path: Path, data: Any) -> None:
+  path = Path(path)
   path.parent.mkdir(parents=True, exist_ok=True)
   tmp = path.with_suffix(path.suffix + ".tmp")
   with open(tmp, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2, default=str)
+    f.flush()
+    os.fsync(f.fileno())
   os.replace(tmp, path)
 
 
@@ -218,7 +294,7 @@ def read_json(path: Path, default: Any = None) -> Any:
 
 
 def update_run_info(run_dir: Path, **fields: Any) -> dict:
-  path = run_dir / "run_info.json"
+  path = Path(run_dir) / "run_info.json"
   data = read_json(path, default={}) or {}
   data.update(fields)
   write_json(path, data)

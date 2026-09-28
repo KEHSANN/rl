@@ -1,0 +1,12 @@
+# Optional systemd user unit: TensorBoard on 127.0.0.1:6006 only.
+[Unit]
+Description=TensorBoard for contact-rl runs
+
+[Service]
+Type=simple
+WorkingDirectory=%h/rl
+ExecStart=%h/.local/bin/uv run tensorboard --logdir runs --host 127.0.0.1 --port 6006
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
