@@ -1,5 +1,5 @@
-"""Process-level runtime helpers: headless GL, console tee, signals, run info,
-device selection and GPU memory statistics.
+"""Process-level runtime helpers: headless GL, console tee, signals, locks,
+run info, device selection and GPU memory statistics.
 
 Nothing in this module imports torch / mujoco / mjlab at module level:
 :func:`configure_headless_rendering` has to run *before* ``import mujoco``
@@ -20,6 +20,7 @@ import platform
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -49,6 +50,10 @@ TRACKED_DISTRIBUTIONS: tuple[str, ...] = (
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
+DUPLICATE_SIGNAL_WINDOW_S = 1.0
+"""A repeated SIGINT within this many seconds of the first stop request is
+treated as a duplicate delivery of the same Ctrl-C (see :class:`StopSignalHandler`)."""
+
 
 def has_display() -> bool:
   return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
@@ -57,13 +62,18 @@ def has_display() -> bool:
 def configure_headless_rendering() -> str:
   """Select a headless OpenGL backend unless the user already chose one.
 
-  No DISPLAY and no MUJOCO_GL -> egl. MUJOCO_GL=egl/osmesa implies the same
-  PYOPENGL_PLATFORM. Must be called before ``mujoco`` is imported; if mujoco is
-  already imported the backend can no longer change and a warning is printed.
+  No DISPLAY and no (or an empty) MUJOCO_GL -> egl. An explicit non-empty
+  MUJOCO_GL is always respected; with a DISPLAY and no MUJOCO_GL MuJoCo keeps
+  its default (GLFW) so local graphical use is unchanged. MUJOCO_GL=egl/osmesa
+  implies the same PYOPENGL_PLATFORM (unless that is set explicitly). Must be
+  called before ``mujoco`` is imported; if mujoco is already imported the
+  backend can no longer change and a warning is printed.
   """
   already = "mujoco" in sys.modules
   before = os.environ.get("MUJOCO_GL")
-  if "MUJOCO_GL" not in os.environ and not has_display():
+  if before is not None and not before.strip():
+    del os.environ["MUJOCO_GL"]  # MUJOCO_GL="" is not a valid MuJoCo backend
+  if not os.environ.get("MUJOCO_GL") and not has_display():
     os.environ["MUJOCO_GL"] = "egl"
   backend = os.environ.get("MUJOCO_GL", "").lower()
   if backend in ("egl", "osmesa"):
@@ -194,19 +204,116 @@ def install_console_tee(log_file: Path) -> None:
   sys.stderr = _Tee(sys.stderr, f)  # type: ignore[assignment]
 
 
-def install_stop_handlers(on_stop: Callable[[str], None]) -> None:
-  """SIGTERM / SIGINT request a graceful stop; a second SIGINT raises
-  KeyboardInterrupt immediately; SIGHUP is ignored (dropped SSH session)."""
+def _signal_name(signum: int) -> str:
+  try:
+    return signal.Signals(signum).name
+  except ValueError:
+    return f"signal {signum}"
 
-  def _handler(signum, _frame):
-    on_stop(signal.Signals(signum).name)
-    if signum == signal.SIGINT:
-      signal.signal(signal.SIGINT, signal.default_int_handler)
 
-  signal.signal(signal.SIGTERM, _handler)
-  signal.signal(signal.SIGINT, _handler)
+class StopSignalHandler:
+  """Graceful-stop signal policy shared by ``contact-train`` and ``contact-watch``.
+
+  * The first SIGINT / SIGTERM calls ``on_stop(name)``: finish the current unit
+    of work (training iteration / evaluation), then exit cleanly.
+  * SIGTERM never escalates: systemd and ``kill`` may deliver it more than once
+    (e.g. to both ``uv`` and its child), and a stop request is idempotent.
+  * A repeated SIGINT within ``window_s`` of the first stop request is treated
+    as a **duplicate delivery** of the same Ctrl-C and ignored. Launchers such
+    as ``uv run`` (and ``tmux send-keys C-c``) can deliver one Ctrl-C twice --
+    once from the terminal to the whole foreground process group and once
+    forwarded by the launcher -- which used to turn a clean stop into a hard
+    abort.
+  * A SIGINT arriving ``window_s`` or more after the stop request is a real
+    second Ctrl-C and calls ``on_abort(name)`` (default: raise
+    :class:`KeyboardInterrupt`). Every later SIGINT escalates again, so
+    legitimate interrupts are never suppressed indefinitely.
+  """
+
+  def __init__(
+    self,
+    on_stop: Callable[[str], None],
+    on_abort: Callable[[str], None] | None = None,
+    window_s: float = DUPLICATE_SIGNAL_WINDOW_S,
+    clock: Callable[[], float] = time.monotonic,
+  ):
+    self._on_stop = on_stop
+    self._on_abort = on_abort
+    self.window_s = float(window_s)
+    self._clock = clock
+    self.stop_requested_at: float | None = None
+    self.ignored = 0
+
+  def __call__(self, signum: int, _frame: Any = None) -> None:
+    name = _signal_name(signum)
+    now = self._clock()
+    if self.stop_requested_at is None:
+      self.stop_requested_at = now
+      self._on_stop(name)
+      return
+    if signum != signal.SIGINT:
+      self._on_stop(name)  # repeated SIGTERM: idempotent stop request
+      return
+    if now - self.stop_requested_at < self.window_s:
+      self.ignored += 1
+      print(
+        f"[INFO] duplicate {name} within {self.window_s:.1f}s of the stop request ignored "
+        "(launcher double delivery); press Ctrl-C again to abort.",
+        file=sys.stderr,
+        flush=True,
+      )
+      return
+    if self._on_abort is None:
+      raise KeyboardInterrupt
+    self._on_abort(name)
+
+
+def install_stop_handlers(
+  on_stop: Callable[[str], None],
+  on_abort: Callable[[str], None] | None = None,
+  window_s: float = DUPLICATE_SIGNAL_WINDOW_S,
+) -> StopSignalHandler:
+  """Install :class:`StopSignalHandler` for SIGTERM / SIGINT; SIGHUP is ignored
+  (dropped SSH session). Returns the handler."""
+  handler = StopSignalHandler(on_stop, on_abort, window_s)
+  signal.signal(signal.SIGTERM, handler)
+  signal.signal(signal.SIGINT, handler)
   if hasattr(signal, "SIGHUP"):
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
+  return handler
+
+
+class LockHeld(RuntimeError):
+  """Another process holds the lock."""
+
+
+def acquire_lock(path: Path) -> Any:
+  """Take an exclusive, non-blocking advisory lock (``flock``) on ``path``.
+
+  The lock lives as long as the returned file object is open and is released
+  by the kernel when the process exits (also on SIGKILL), so a crashed holder
+  never leaves a stale lock behind. Raises :class:`LockHeld` if another open
+  file description (another process) holds it.
+  """
+  import fcntl  # Linux / macOS only; the VPS target is Linux
+
+  path = Path(path)
+  path.parent.mkdir(parents=True, exist_ok=True)
+  f = open(path, "a+", encoding="utf-8")  # noqa: SIM115
+  try:
+    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+  except OSError as e:
+    try:
+      f.seek(0)
+      holder = f.read().strip()
+    finally:
+      f.close()
+    raise LockHeld(f"{path} is held by {holder or 'another process'}") from e
+  f.seek(0)
+  f.truncate()
+  f.write(f"pid {os.getpid()} since {now_iso()}\n")
+  f.flush()
+  return f
 
 
 def repo_root() -> Path:

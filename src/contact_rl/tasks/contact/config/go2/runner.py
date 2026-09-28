@@ -16,9 +16,13 @@ Extends mjlab's :class:`MjlabOnPolicyRunner` with
   iteration and overwrite its checkpoint); the resume source can never be
   written to;
 * **graceful stop**: :meth:`request_stop` (SIGTERM / SIGINT) finishes the
-  current iteration, writes a checkpoint and raises :class:`TrainingStopped`;
+  current iteration, writes a checkpoint, closes the logger (so a W&B run is
+  finished) and raises :class:`TrainingStopped`;
 * **GRU ONNX export** through :mod:`contact_rl.utils.onnx_compat` (rsl-rl
-  5.0.1 declares 2 output names but returns 3 values for GRUs).
+  5.0.1 declares 2 output names but returns 3 values for GRUs). The export
+  status is reported by :mod:`contact_rl.utils.onnx_export`: a written
+  ``policy.onnx`` is never reported as a failure because the optional wandb
+  package (only used for the metadata run name) is missing.
 
 Without :meth:`configure_run` (e.g. used through mjlab's own CLI) the runner
 behaves like before, with checkpoints under ``<log_dir>/checkpoints``.
@@ -37,6 +41,7 @@ from mjlab.rl.runner import MjlabOnPolicyRunner
 
 from contact_rl.utils import checkpoints as ckpt
 from contact_rl.utils.onnx_compat import export_policy_onnx
+from contact_rl.utils.onnx_export import export_onnx_with_metadata, wandb_run_name
 from contact_rl.utils.runtime import gpu_memory_stats, now_iso, update_run_info
 from contact_rl.utils.train_stats import explained_variance
 
@@ -88,7 +93,7 @@ class ContactOnPolicyRunner(MjlabOnPolicyRunner):
 
   def request_stop(self, reason: str) -> None:
     if self._stop_reason is None:
-      print(f"\n[INFO] {reason} received: stopping after the current iteration (Ctrl-C again to abort).")
+      print(f"\n[INFO] {reason} received: stopping after the current iteration (Ctrl-C again to abort).", flush=True)
     self._stop_reason = reason
 
   # ----------------------------------------------------------------- resume
@@ -104,6 +109,11 @@ class ContactOnPolicyRunner(MjlabOnPolicyRunner):
     return loaded_it
 
   # --------------------------------------------------------------- logging
+
+  def _writer(self):
+    """rsl-rl creates ``logger.writer`` lazily in ``init_logging_writer``
+    (inside ``learn``); None before that or when not logging."""
+    return getattr(self.logger, "writer", None)
 
   def _wrap_logger(self) -> None:
     orig_log = self.logger.log
@@ -122,7 +132,7 @@ class ContactOnPolicyRunner(MjlabOnPolicyRunner):
     it = int(kw["it"])
     ct, lt = float(kw["collect_time"]), float(kw["learn_time"])
     loss = kw.get("loss_dict") or {}
-    writer = self.logger.writer
+    writer = self._writer()
     steps = self.cfg["num_steps_per_env"] * self.env.num_envs
     scalars: dict[str, float] = {
       "training/iteration_time": ct + lt,
@@ -160,6 +170,12 @@ class ContactOnPolicyRunner(MjlabOnPolicyRunner):
       if writer is not None:
         self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore[arg-type]
         writer.flush()
+        # rsl-rl's learn() closes the logger only after its loop; we leave the
+        # loop by raising, so close it here (finishes a W&B run cleanly).
+        try:
+          self.logger.stop_logging_writer()
+        except Exception as e:  # noqa: BLE001
+          print(f"[WARN] closing the logger failed: {type(e).__name__}: {e}")
       raise TrainingStopped(self._stop_reason)
 
   # ------------------------------------------------------------------ save
@@ -195,7 +211,7 @@ class ContactOnPolicyRunner(MjlabOnPolicyRunner):
       target, it, BEST_METRIC, self._mean_reward(), self.retention, protect={p for p in protect if p is not None}
     )
     self._last_saved_it = it
-    writer = self.logger.writer
+    writer = self._writer()
     if writer is not None:
       writer.add_scalar("checkpoint/iteration", it, it)
       if res["is_best"]:
@@ -209,16 +225,17 @@ class ContactOnPolicyRunner(MjlabOnPolicyRunner):
 
   def _export_onnx(self, run_dir: Path) -> None:
     out_dir = run_dir / "exported"
-    try:
-      onnx_path = export_policy_onnx(self.alg.get_policy(), str(out_dir), "policy.onnx")
-      import wandb
-
-      run_name = wandb.run.name if self.logger.logger_type == "wandb" and wandb.run else "local"
-      attach_metadata_to_onnx(onnx_path, get_base_metadata(self.env.unwrapped, run_name))
-    except Exception as e:  # never kill training for an export; record it loudly
-      print(f"[ERROR] ONNX export failed (training continues): {type(e).__name__}: {e}")
-      if (run_dir / "run_info.json").exists():
-        update_run_info(run_dir, onnx_export_error=f"{type(e).__name__}: {e}")
+    run_name = wandb_run_name(getattr(self.logger, "logger_type", None))
+    res = export_onnx_with_metadata(
+      lambda: export_policy_onnx(self.alg.get_policy(), str(out_dir), "policy.onnx"),
+      lambda p: attach_metadata_to_onnx(str(p), get_base_metadata(self.env.unwrapped, run_name)),
+    )
+    if res["status"] == "failed":  # never kill training for an export; record it loudly
+      print(f"[ERROR] ONNX export failed (training continues): {res['error']}")
+    elif res["status"] == "ok_without_metadata":
+      print(f"[WARN] wrote {res['path']} but could not attach metadata: {res['metadata']}")
+    if (run_dir / "run_info.json").exists():
+      update_run_info(run_dir, onnx_export=res, onnx_export_error=res["error"])
 
   def export_policy_to_onnx(self, path: str, filename: str = "policy.onnx", verbose: bool = False) -> None:
     export_policy_onnx(self.alg.get_policy(), path, filename, verbose)

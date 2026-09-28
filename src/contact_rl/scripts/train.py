@@ -3,7 +3,8 @@
 Registers the contact tasks, then trains with mjlab's env + the project
 runner, adding run management on top of mjlab's ``train`` CLI. Every mjlab
 ``TrainConfig`` flag still works (``--env.*``, ``--agent.*``, ``--video``,
-``--video-length``, ``--video-interval``, ``--gpu-ids`` ...), plus::
+``--video-length``, ``--video-interval``, ``--gpu-ids``,
+``--enable-nan-guard`` ...), plus::
 
   --resume-from SPEC   checkpoint file | run dir | run_dir:<it>|best|latest |
                        latest | best  (full state; continues at iter+1 in a
@@ -15,20 +16,29 @@ runner, adding run management on top of mjlab's ``train`` CLI. Every mjlab
   --keep-best BOOL     maintain checkpoints/best.pt (by mean episode reward)
   --export-onnx BOOL   write exported/policy.onnx at every save
 
-Example::
+Examples::
 
-  uv run contact-train Mjlab-Contact-Flat-Unitree-Go2 --env.scene.num-envs 4096
+  uv run contact-train Mjlab-Contact-Flat-Unitree-Go2          # paper default: 8192 envs
+  uv run contact-train Mjlab-Contact-Flat-Unitree-Go2 --env.scene.num-envs 4096   # lower-VRAM fallback
 
-Multi-GPU (``--gpu-ids`` with more than one id) is delegated unchanged to
-mjlab's torchrunx launcher (legacy logs/rsl_rl layout, no run management).
+``--enable-nan-guard True`` turns on mjlab's simulation NaN guard
+(``env.sim.nan_guard.enabled``), exactly like mjlab's own ``train`` CLI.
+
+GPUs: ``--gpu-ids 0`` (default) / ``--gpu-ids 1`` / ``--gpu-ids all`` with one
+visible GPU all train in this process with full run management. Only when
+more than one GPU is actually selected (``--gpu-ids 0 1``, or ``all`` with
+several visible GPUs) is training delegated unchanged to mjlab's torchrunx
+launcher (legacy logs/rsl_rl layout, no run management).
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any, Callable
 
 from contact_rl.utils.runtime import configure_headless_rendering
 
@@ -53,6 +63,49 @@ def _config_cls():
   return ContactTrainConfig
 
 
+# ------------------------------------------------------------ torch-free helpers
+
+
+def count_visible_gpus() -> int:
+  """Number of CUDA devices this process can use. ``CUDA_VISIBLE_DEVICES``
+  (if set) is authoritative; otherwise ask torch (0 if torch/CUDA is
+  unavailable)."""
+  env = os.environ.get("CUDA_VISIBLE_DEVICES")
+  if env is not None:
+    ids = [s.strip() for s in env.split(",") if s.strip()]
+    out = []
+    for s in ids:
+      if s.startswith("-"):  # "-1" hides this and all following devices
+        break
+      out.append(s)
+    return len(out)
+  try:
+    import torch
+
+    return int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+  except Exception:
+    return 0
+
+
+def is_multi_gpu(gpu_ids: Any, visible: Callable[[], int] = count_visible_gpus) -> bool:
+  """True only if training would really use more than one GPU. ``"all"`` on a
+  single-GPU machine is a single-GPU run (keeps contact-train run management)."""
+  if gpu_ids == "all":
+    return visible() > 1
+  if isinstance(gpu_ids, (list, tuple)):
+    return len(gpu_ids) > 1
+  return False
+
+
+def apply_nan_guard(cfg: Any) -> bool:
+  """Connect ``--enable-nan-guard`` to the env config (mjlab's ``run_train``
+  does the same). Returns whether the guard is enabled."""
+  if getattr(cfg, "enable_nan_guard", False):
+    cfg.env.sim.nan_guard.enabled = True
+  guard = getattr(getattr(cfg.env, "sim", None), "nan_guard", None)
+  return bool(getattr(guard, "enabled", False))
+
+
 def _pick_device(cfg) -> str:
   from contact_rl.utils.runtime import resolve_device
 
@@ -62,6 +115,9 @@ def _pick_device(cfg) -> str:
   if ids is None:
     return "cpu"
   if ids == "all":
+    if count_visible_gpus() == 0:
+      print("[WARN] --gpu-ids all but no CUDA device is visible; training on cpu.")
+      return "cpu"
     return resolve_device("cuda:0")
   return resolve_device(f"cuda:{ids[0]}") if ids else "cpu"
 
@@ -117,6 +173,7 @@ def run_contact_train(task_id: str, cfg) -> int:
   rt.install_console_tee(run_dir / "logs" / "train.log")
 
   cfg.env.seed = cfg.agent.seed
+  nan_guard = apply_nan_guard(cfg)  # must happen before the env (and its sim) is built
   env = ManagerBasedRlEnv(cfg=cfg.env, device=device, render_mode="rgb_array" if cfg.video else None)
   nspe = int(cfg.agent.num_steps_per_env)
   if cfg.video:
@@ -165,20 +222,24 @@ def run_contact_train(task_id: str, cfg) -> int:
     task=task_id,
     experiment=cfg.agent.experiment_name,
     device=device,
+    gpu_ids=cfg.gpu_ids,
     num_envs=int(cfg.env.scene.num_envs),
     max_iterations=int(cfg.agent.max_iterations),
     seed=int(cfg.agent.seed),
+    logger=agent_cfg.get("logger"),
+    nan_guard=nan_guard,
     git=rt.git_info(),
     versions=rt.distribution_versions(),
     hardware=gpu,
-    mujoco_gl=__import__("os").environ.get("MUJOCO_GL"),
+    mujoco_gl=os.environ.get("MUJOCO_GL"),
     resume=resume_meta,
     started=rt.now_iso(),
     retention={"keep_last": cfg.keep_last, "keep_every": cfg.keep_every, "keep_best": cfg.keep_best},
   )
   start = int(runner.current_learning_iteration)
   print("=" * 78)
-  print(f"[contact-train] task={task_id}  device={device}  num_envs={cfg.env.scene.num_envs}")
+  print(f"[contact-train] task={task_id}  device={device}  num_envs={cfg.env.scene.num_envs}  "
+        f"logger={agent_cfg.get('logger')}  nan_guard={nan_guard}")
   print(f"[contact-train] run dir: {run_dir}")
   print(f"[contact-train] iterations {start} .. {start + cfg.agent.max_iterations - 1} (save every {cfg.agent.save_interval})")
   print(f"[contact-train] git: {json.dumps(info.get('git'))}")
@@ -192,6 +253,9 @@ def run_contact_train(task_id: str, cfg) -> int:
   print("=" * 78, flush=True)
 
   if managed:
+    # First SIGINT/SIGTERM: stop after this iteration; a duplicate SIGINT
+    # (uv run / tmux double delivery) within 1 s is ignored; a later Ctrl-C
+    # raises KeyboardInterrupt (hard abort, exit 130).
     rt.install_stop_handlers(runner.request_stop)
   code = 0
   try:
@@ -233,8 +297,7 @@ def parse_args(argv: list[str] | None = None):
 
 def main() -> None:
   task, args = parse_args()
-  ids = args.gpu_ids
-  if (ids == "all") or (isinstance(ids, list) and len(ids) > 1):
+  if is_multi_gpu(args.gpu_ids):
     from mjlab.scripts.train import launch_training
 
     print("[WARN] multi-GPU: delegating to mjlab's launcher (logs/rsl_rl layout, no contact-train run management).")
