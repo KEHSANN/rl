@@ -1,43 +1,44 @@
 """On-policy runner for the contact-explicit task.
 
-Extends mjlab's :class:`MjlabOnPolicyRunner` with:
+Extends mjlab's :class:`MjlabOnPolicyRunner` with ONNX export on save and the
+paper's **entropy decay** (Section 4, "Training").
 
-1. ONNX export on checkpoint save (same behaviour as mjlab's
-   ``VelocityOnPolicyRunner``), and
-2. the paper's **linear entropy decay** (Section 4, "Training").
-
-rsl-rl's ``PPO.entropy_coef`` is a plain mutable float with no built-in
-schedule, so the decay is applied by chunking ``learn`` and re-setting
-``self.alg.entropy_coef`` between chunks (each ``super().learn`` call continues
-from ``current_learning_iteration``, so the chunks compose into one run). A
-guard completes any remaining iterations in a single call if the decay
-bookkeeping ever raises, so a training run never dies on account of the
-schedule. Tune the schedule via the module-level constants below.
+Entropy decay is applied by wrapping ``self.alg.update`` so the coefficient is
+set right before every PPO update, inside a *single* ``learn()`` call. The
+previous revision chunked ``learn()`` into 50-iteration calls instead, which
+(i) re-ran the last iteration of every chunk (rsl-rl stores
+``current_learning_iteration = it``, and the next call starts from it), (ii)
+reset the episode reward/length buffers every chunk, (iii) triggered rsl-rl's
+end-of-``learn`` checkpoint every chunk, and (iv) wrapped everything in a
+``try/except`` that silently restarted training after *any* exception.
 """
 
 from __future__ import annotations
 
 import os
 
-import torch
 import wandb
 
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.rl.exporter_utils import attach_metadata_to_onnx, get_base_metadata
 from mjlab.rl.runner import MjlabOnPolicyRunner
 
-# --- Entropy-decay schedule (realises the paper's "entropy decay"). ---
-ENTROPY_DECAY_ENABLED = True
-ENTROPY_START = 0.01
-ENTROPY_END = 0.001
-ENTROPY_DECAY_ITERS = 5000  # Iterations over which to anneal START -> END.
-ENTROPY_UPDATE_EVERY = 50  # Re-set the coefficient every N iterations.
+from .rl_cfg import (
+  ENTROPY_DECAY_ITERS,
+  ENTROPY_END,
+  ENTROPY_START,
+)
+
+
+def entropy_at(iteration: int) -> float:
+  """Linear entropy schedule, clamped to ``ENTROPY_END`` after decay."""
+  frac = min(max(iteration / float(max(ENTROPY_DECAY_ITERS, 1)), 0.0), 1.0)
+  return ENTROPY_START + frac * (ENTROPY_END - ENTROPY_START)
 
 
 class ContactOnPolicyRunner(MjlabOnPolicyRunner):
   env: RslRlVecEnvWrapper
 
-  # --- ONNX export on save (mirrors VelocityOnPolicyRunner). ---
   def save(self, path: str, infos=None) -> None:
     super().save(path, infos)
     policy_path = path.split("model")[0]
@@ -52,28 +53,29 @@ class ContactOnPolicyRunner(MjlabOnPolicyRunner):
       attach_metadata_to_onnx(onnx_path, metadata)
       if self.logger.logger_type in ["wandb"] and self.cfg["upload_model"]:
         wandb.save(policy_path + filename, base_path=os.path.dirname(policy_path))
-    except Exception as e:
+    except Exception as e:  # Export is a convenience; never kill training.
       print(f"[WARN] ONNX export failed (training continues): {e}")
 
-  # --- Entropy decay. ---
-  def _entropy_at(self, iteration: int) -> float:
-    frac = min(max(iteration / float(ENTROPY_DECAY_ITERS), 0.0), 1.0)
-    return ENTROPY_START + frac * (ENTROPY_END - ENTROPY_START)
+  def _install_entropy_schedule(self) -> None:
+    if getattr(self, "_entropy_schedule_installed", False):
+      return
+    if not hasattr(self.alg, "entropy_coef"):
+      raise AttributeError("PPO algorithm has no 'entropy_coef'; cannot decay it.")
+    original_update = self.alg.update
+    self._entropy_updates = 0
+
+    def update_with_entropy_decay(*args, **kwargs):
+      it = self._entropy_it0 + self._entropy_updates
+      self.alg.entropy_coef = entropy_at(it)
+      self._entropy_updates += 1
+      return original_update(*args, **kwargs)
+
+    self.alg.update = update_with_entropy_decay  # type: ignore[method-assign]
+    self._entropy_schedule_installed = True
 
   def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
-    if not ENTROPY_DECAY_ENABLED or not hasattr(self.alg, "entropy_coef"):
-      return super().learn(num_learning_iterations, init_at_random_ep_len)
-
-    try:
-      remaining = num_learning_iterations
-      first = True
-      while remaining > 0:
-        chunk = min(ENTROPY_UPDATE_EVERY, remaining)
-        self.alg.entropy_coef = self._entropy_at(self.current_learning_iteration)
-        super().learn(chunk, init_at_random_ep_len and first)
-        remaining -= chunk
-        first = False
-    except Exception as e:
-      print(f"[WARN] entropy-decay loop failed ({e}); continuing without decay.")
-      if remaining > 0:
-        super().learn(remaining, init_at_random_ep_len and first)
+    # Resume-aware: the schedule continues from the loaded iteration.
+    self._entropy_it0 = int(self.current_learning_iteration)
+    self._install_entropy_schedule()
+    self._entropy_updates = 0
+    return super().learn(num_learning_iterations, init_at_random_ep_len)

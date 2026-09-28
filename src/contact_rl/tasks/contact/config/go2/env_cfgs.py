@@ -17,18 +17,22 @@ from contact_rl.tasks.contact.contact_env_cfg import (
 _FOOT_GEOMS = tuple(f"{name}_foot_collision" for name in FOOT_ORDER)
 
 
-def unitree_go2_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-  """Create the Unitree Go2 flat-terrain contact-explicit configuration."""
-  cfg = make_contact_env_cfg()
+def unitree_go2_flat_env_cfg(
+  play: bool = False, improved: bool = False
+) -> ManagerBasedRlEnvCfg:
+  """Go2 flat-terrain contact-explicit configuration.
 
-  # Robot entity.
+  Args:
+    play: Evaluation / visualisation variant (no pushes, no obs noise).
+    improved: EXPERIMENTAL variant -- adds IMU signals to the actor (see
+      ``make_contact_env_cfg``). ``False`` is the paper-faithful task.
+  """
+  cfg = make_contact_env_cfg(actor_imu=improved)
+
   cfg.scene.entities = {"robot": get_go2_robot_cfg()}
 
-  # Foot / ground contact sensor. NOTE: ``ContactSensor`` resolves ``pattern``
-  # with ``find_geoms(..., preserve_order=False)``, so the ``found`` columns
-  # follow the MJCF *declaration* order, not the order of this tuple. go2.xml
-  # declares the feet FL, FR, RL, RR, so the two coincide; the
-  # ``check_foot_ordering`` startup event asserts it rather than assuming it.
+  # Foot / ground contact sensor. ``ContactSensor`` resolves ``pattern`` in MJCF
+  # declaration order; ``check_foot_ordering`` asserts it matches FOOT_ORDER.
   feet_ground_cfg = ContactSensorCfg(
     name=FEET_SENSOR_NAME,
     primary=ContactMatch(mode="geom", pattern=_FOOT_GEOMS, entity="robot"),
@@ -40,16 +44,13 @@ def unitree_go2_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   )
   cfg.scene.sensors = (cfg.scene.sensors or ()) + (feet_ground_cfg,)
 
-  # Action scale (per-actuator, from the Go2 constants).
   joint_pos_action = cfg.actions["joint_pos"]
   assert isinstance(joint_pos_action, JointPositionActionCfg)
   joint_pos_action.scale = GO2_ACTION_SCALE
 
-  # Per-robot event targets.
   cfg.events["foot_friction"].params["asset_cfg"].geom_names = _FOOT_GEOMS
   cfg.events["base_com"].params["asset_cfg"].body_names = ("base_link",)
 
-  # Viewer follows the base.
   cfg.viewer.body_name = "base_link"
 
   if play:

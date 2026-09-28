@@ -1,20 +1,12 @@
 """RL configuration for the Unitree Go2 contact-explicit locomotion task.
 
-The paper (Section 4, "Training") uses **PPO with a recurrent (GRU) actor and
-entropy decay**. Both are realised here on the pinned stack (``rsl-rl-lib==5.0.1``):
-
-* **Recurrent actor/critic** -- rsl-rl>=5.0.0 unifies recurrence under the model
-  ``class_name="RNNModel"`` (``rsl_rl/models/rnn_model.py``), which inherits from
-  ``MLPModel`` and adds ``rnn_type`` / ``rnn_hidden_dim`` / ``rnn_num_layers``.
-  mjlab converts the runner cfg with ``dataclasses.asdict`` and forwards the
-  ``actor`` / ``critic`` dicts to rsl-rl's model builder without dropping unknown
-  keys, so the :class:`RslRlRnnModelCfg` subclass below flows straight through.
-  PPO then auto-detects recurrence (``actor_critic.is_recurrent`` ->
-  ``recurrent_mini_batch_generator``) and manages hidden states / BPTT masking
-  itself -- no custom generator needed.
-* **Entropy decay** -- ``PPO.entropy_coef`` is a plain mutable float with no
-  internal schedule, so :class:`ContactOnPolicyRunner` anneals it during training
-  by writing ``self.alg.entropy_coef`` (see ``runner.py``).
+The paper (Section 4, "Training") uses **PPO with a recurrent (GRU) policy and
+entropy decay** (8192 envs in IsaacLab). On the pinned stack
+(``rsl-rl-lib==5.0.1``) recurrence is rsl-rl's ``class_name="RNNModel"``;
+mjlab forwards the ``actor`` / ``critic`` dicts unchanged, so the
+:class:`RslRlRnnModelCfg` subclass below flows through and PPO switches to the
+recurrent mini-batch generator automatically. Entropy decay is applied by
+:class:`~.runner.ContactOnPolicyRunner`.
 """
 
 from __future__ import annotations
@@ -27,15 +19,16 @@ from mjlab.rl import (
   RslRlPpoAlgorithmCfg,
 )
 
+# Entropy-decay schedule (read by ContactOnPolicyRunner). Linear START -> END
+# over DECAY_ITERS PPO iterations, constant afterwards.
+ENTROPY_START = 0.01
+ENTROPY_END = 0.001
+ENTROPY_DECAY_ITERS = 5000
+
 
 @dataclass
 class RslRlRnnModelCfg(RslRlModelCfg):
-  """``RslRlModelCfg`` extended with rsl-rl 5.x recurrent (``RNNModel``) fields.
-
-  All base ``MLPModel`` keys (``hidden_dims``, ``activation``,
-  ``distribution_cfg``, ...) are inherited and apply to the post-recurrent MLP
-  head; the ``rnn_*`` fields configure the GRU/LSTM core.
-  """
+  """``RslRlModelCfg`` extended with rsl-rl 5.x ``RNNModel`` fields."""
 
   class_name: str = "RNNModel"
   rnn_type: str = "gru"  # "gru" (paper) or "lstm".
@@ -43,13 +36,14 @@ class RslRlRnnModelCfg(RslRlModelCfg):
   rnn_num_layers: int = 1
 
 
-def unitree_go2_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
-  """Create the RL runner configuration for the Go2 contact-explicit task."""
+def unitree_go2_ppo_runner_cfg(improved: bool = False) -> RslRlOnPolicyRunnerCfg:
+  """PPO runner cfg. ``improved`` enables running observation normalisation
+  (EXPERIMENTAL; the observation mixes metres, rad/s and binary flags)."""
   return RslRlOnPolicyRunnerCfg(
     actor=RslRlRnnModelCfg(
       hidden_dims=(512, 256, 128),
       activation="elu",
-      obs_normalization=False,
+      obs_normalization=improved,
       rnn_type="gru",
       rnn_hidden_dim=256,
       rnn_num_layers=1,
@@ -62,7 +56,7 @@ def unitree_go2_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
     critic=RslRlRnnModelCfg(
       hidden_dims=(512, 256, 128),
       activation="elu",
-      obs_normalization=False,
+      obs_normalization=improved,
       rnn_type="gru",
       rnn_hidden_dim=256,
       rnn_num_layers=1,
@@ -71,8 +65,7 @@ def unitree_go2_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
       value_loss_coef=1.0,
       use_clipped_value_loss=True,
       clip_param=0.2,
-      # Entropy-decay start value; ContactOnPolicyRunner decays it over training.
-      entropy_coef=0.01,
+      entropy_coef=ENTROPY_START,  # Decayed by ContactOnPolicyRunner.
       num_learning_epochs=5,
       num_mini_batches=4,
       learning_rate=1.0e-3,
@@ -82,7 +75,8 @@ def unitree_go2_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
       desired_kl=0.01,
       max_grad_norm=1.0,
     ),
-    experiment_name="go2_contact",
+    seed=42,
+    experiment_name="go2_contact_improved" if improved else "go2_contact",
     save_interval=50,
     num_steps_per_env=24,
     max_iterations=10_000,
