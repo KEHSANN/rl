@@ -8,6 +8,8 @@
 # Uses the task's own num_envs (paper default 8192). On a lower-VRAM GPU add
 # `--env.scene.num-envs 4096` to ExecStart (or a drop-in via `systemctl --user edit`).
 # `systemctl --user stop` sends SIGTERM -> checkpoint -> clean exit.
+# KillMode=mixed: SIGTERM goes to `uv` only (uv forwards it to contact-train);
+# SIGKILL after TimeoutStopSec still reaches the whole cgroup.
 [Unit]
 Description=contact-rl training (%i)
 After=network-online.target
@@ -19,6 +21,7 @@ Environment=MUJOCO_GL=egl
 Environment=PYOPENGL_PLATFORM=egl
 ExecStart=%h/.local/bin/uv run contact-train %i
 KillSignal=SIGTERM
+KillMode=mixed
 TimeoutStopSec=300
 Restart=no
 

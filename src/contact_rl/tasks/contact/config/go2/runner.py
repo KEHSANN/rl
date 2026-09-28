@@ -16,8 +16,8 @@ Extends mjlab's :class:`MjlabOnPolicyRunner` with
   iteration and overwrite its checkpoint); the resume source can never be
   written to;
 * **graceful stop**: :meth:`request_stop` (SIGTERM / SIGINT) finishes the
-  current iteration, writes a checkpoint, closes the logger (so a W&B run is
-  finished) and raises :class:`TrainingStopped`;
+  current iteration, always writes a checkpoint, closes the logger (so a W&B
+  run is finished) and raises :class:`TrainingStopped`;
 * **GRU ONNX export** through :mod:`contact_rl.utils.onnx_compat` (rsl-rl
   5.0.1 declares 2 output names but returns 3 values for GRUs). The export
   status is reported by :mod:`contact_rl.utils.onnx_export`: a written
@@ -167,8 +167,12 @@ class ContactOnPolicyRunner(MjlabOnPolicyRunner):
         flush=True,
       )
     if self._stop_reason is not None:
+      # Always write the stop checkpoint: it must not depend on the logger
+      # having a writer (the TensorBoard/W&B extras above are optional).
+      # ``save`` maps the name onto <run_dir>/checkpoints/model_<it>.pt.
+      log_dir = getattr(self.logger, "log_dir", None) or (str(self.run_dir) if self.run_dir else ".")
+      self.save(os.path.join(log_dir, f"model_{it}.pt"))
       if writer is not None:
-        self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore[arg-type]
         writer.flush()
         # rsl-rl's learn() closes the logger only after its loop; we leave the
         # loop by raising, so close it here (finishes a W&B run cleanly).

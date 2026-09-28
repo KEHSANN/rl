@@ -29,6 +29,11 @@ visible GPU all train in this process with full run management. Only when
 more than one GPU is actually selected (``--gpu-ids 0 1``, or ``all`` with
 several visible GPUs) is training delegated unchanged to mjlab's torchrunx
 launcher (legacy logs/rsl_rl layout, no run management).
+
+Exit codes: 0 = finished or stopped cleanly (SIGINT/SIGTERM), 130 = hard abort
+(second Ctrl-C), 1 = any other error (the traceback is re-raised). The code is
+recorded as ``exit_code`` in ``run_info.json`` in every case, and the env is
+closed even if the runner, the resume load or training itself fails.
 """
 
 from __future__ import annotations
@@ -106,6 +111,16 @@ def apply_nan_guard(cfg: Any) -> bool:
   return bool(getattr(guard, "enabled", False))
 
 
+def close_quietly(env: Any) -> None:
+  """Close ``env`` (if any) without letting a close failure mask the real error."""
+  if env is None:
+    return
+  try:
+    env.close()
+  except Exception as e:  # noqa: BLE001
+    print(f"[WARN] env close failed: {e}")
+
+
 def _pick_device(cfg) -> str:
   from contact_rl.utils.runtime import resolve_device
 
@@ -175,103 +190,111 @@ def run_contact_train(task_id: str, cfg) -> int:
   cfg.env.seed = cfg.agent.seed
   nan_guard = apply_nan_guard(cfg)  # must happen before the env (and its sim) is built
   env = ManagerBasedRlEnv(cfg=cfg.env, device=device, render_mode="rgb_array" if cfg.video else None)
-  nspe = int(cfg.agent.num_steps_per_env)
-  if cfg.video:
-    env = StreamingVideoRecorder(
-      env,
-      path_fn=lambda s: run_dir / "videos" / "train" / f"iteration_{s // nspe:06d}" / f"step_{s:09d}.mp4",
-      step_trigger=lambda s: s % cfg.video_interval == 0,
-      video_length=cfg.video_length,
-      hud_fn=lambda s: [f"train it {s // nspe}", f"step {s}"],
-    )
-  venv = RslRlVecEnvWrapper(env, clip_actions=cfg.agent.clip_actions)
-
-  agent_cfg = asdict(cfg.agent)
-  env_cfg = asdict(cfg.env)
-  runner_cls = load_runner_cls(task_id) or MjlabOnPolicyRunner
-  runner = runner_cls(venv, agent_cfg, str(run_dir), device)
-  managed = isinstance(runner, ContactOnPolicyRunner)
-  if managed:
-    runner.configure_run(
-      run_dir, ck.RetentionPolicy(cfg.keep_last, cfg.keep_every, cfg.keep_best), export_onnx=cfg.export_onnx
-    )
-  else:
-    print(f"[WARN] runner {runner_cls.__name__} is not a ContactOnPolicyRunner: no checkpoint management.")
-  runner.add_git_repo_to_log(contact_rl.__file__)
-
-  resume_meta = None
-  if resume_path is not None:
-    if managed:
-      loaded = runner.load_for_resume(resume_path, map_location=device)
-    else:
-      runner.load(str(resume_path), map_location=device)
-      loaded = int(runner.current_learning_iteration)
-    resume_meta = {
-      "source": str(resume_path),
-      "source_run": str(ck.run_dir_of_checkpoint(resume_path)),
-      "source_iteration": loaded,
-      "start_iteration": int(runner.current_learning_iteration),
-    }
-
-  dump_yaml(run_dir / "config" / "env.yaml", env_cfg)
-  dump_yaml(run_dir / "config" / "agent.yaml", agent_cfg)
-  rt.write_json(run_dir / "config" / "cli.json", {"argv": sys.argv, "task": task_id})
-  gpu = rt.hardware_info()
-  info = rt.update_run_info(
-    run_dir,
-    task=task_id,
-    experiment=cfg.agent.experiment_name,
-    device=device,
-    gpu_ids=cfg.gpu_ids,
-    num_envs=int(cfg.env.scene.num_envs),
-    max_iterations=int(cfg.agent.max_iterations),
-    seed=int(cfg.agent.seed),
-    logger=agent_cfg.get("logger"),
-    nan_guard=nan_guard,
-    git=rt.git_info(),
-    versions=rt.distribution_versions(),
-    hardware=gpu,
-    mujoco_gl=os.environ.get("MUJOCO_GL"),
-    resume=resume_meta,
-    started=rt.now_iso(),
-    retention={"keep_last": cfg.keep_last, "keep_every": cfg.keep_every, "keep_best": cfg.keep_best},
-  )
-  start = int(runner.current_learning_iteration)
-  print("=" * 78)
-  print(f"[contact-train] task={task_id}  device={device}  num_envs={cfg.env.scene.num_envs}  "
-        f"logger={agent_cfg.get('logger')}  nan_guard={nan_guard}")
-  print(f"[contact-train] run dir: {run_dir}")
-  print(f"[contact-train] iterations {start} .. {start + cfg.agent.max_iterations - 1} (save every {cfg.agent.save_interval})")
-  print(f"[contact-train] git: {json.dumps(info.get('git'))}")
-  v = info["versions"]
-  print(f"[contact-train] torch={v.get('torch')} mjlab={v.get('mjlab')} rsl-rl={v.get('rsl-rl-lib')} mujoco={v.get('mujoco')} warp={v.get('warp-lang')}")
-  for g in gpu.get("gpus", []):
-    print(f"[contact-train] GPU{g['index']}: {g['name']} {g['vram_gib']} GiB (sm_{g['capability']})")
-  if resume_meta:
-    print(f"[contact-train] resumed from {resume_meta['source']} (iter {resume_meta['source_iteration']}) -> starting at {start}")
-  print(f"[contact-train] TensorBoard: uv run tensorboard --logdir {Path(cfg.run_root)} --host 127.0.0.1 --port 6006")
-  print("=" * 78, flush=True)
-
-  if managed:
-    # First SIGINT/SIGTERM: stop after this iteration; a duplicate SIGINT
-    # (uv run / tmux double delivery) within 1 s is ignored; a later Ctrl-C
-    # raises KeyboardInterrupt (hard abort, exit 130).
-    rt.install_stop_handlers(runner.request_stop)
-  code = 0
+  # Everything from here on runs under try/finally: a failing runner
+  # construction, resume load, CUDA OOM or NaN still closes the env (EGL
+  # context, ffmpeg) and records the real exit code in run_info.json.
+  closable: Any = env
+  runner = None
+  code = 1
   try:
-    runner.learn(num_learning_iterations=cfg.agent.max_iterations, init_at_random_ep_len=True)
-    print("[contact-train] finished.")
-  except TrainingStopped as e:
-    print(f"[contact-train] stopped cleanly on {e}; last checkpoint iteration {runner._last_saved_it}.")
+    nspe = int(cfg.agent.num_steps_per_env)
+    if cfg.video:
+      env = StreamingVideoRecorder(
+        env,
+        path_fn=lambda s: run_dir / "videos" / "train" / f"iteration_{s // nspe:06d}" / f"step_{s:09d}.mp4",
+        step_trigger=lambda s: s % cfg.video_interval == 0,
+        video_length=cfg.video_length,
+        hud_fn=lambda s: [f"train it {s // nspe}", f"step {s}"],
+      )
+      closable = env
+    venv = RslRlVecEnvWrapper(env, clip_actions=cfg.agent.clip_actions)
+    closable = venv
+
+    agent_cfg = asdict(cfg.agent)
+    env_cfg = asdict(cfg.env)
+    runner_cls = load_runner_cls(task_id) or MjlabOnPolicyRunner
+    runner = runner_cls(venv, agent_cfg, str(run_dir), device)
+    managed = isinstance(runner, ContactOnPolicyRunner)
+    if managed:
+      runner.configure_run(
+        run_dir, ck.RetentionPolicy(cfg.keep_last, cfg.keep_every, cfg.keep_best), export_onnx=cfg.export_onnx
+      )
+    else:
+      print(f"[WARN] runner {runner_cls.__name__} is not a ContactOnPolicyRunner: no checkpoint management.")
+    runner.add_git_repo_to_log(contact_rl.__file__)
+
+    resume_meta = None
+    if resume_path is not None:
+      if managed:
+        loaded = runner.load_for_resume(resume_path, map_location=device)
+      else:
+        runner.load(str(resume_path), map_location=device)
+        loaded = int(runner.current_learning_iteration)
+      resume_meta = {
+        "source": str(resume_path),
+        "source_run": str(ck.run_dir_of_checkpoint(resume_path)),
+        "source_iteration": loaded,
+        "start_iteration": int(runner.current_learning_iteration),
+      }
+
+    dump_yaml(run_dir / "config" / "env.yaml", env_cfg)
+    dump_yaml(run_dir / "config" / "agent.yaml", agent_cfg)
+    rt.write_json(run_dir / "config" / "cli.json", {"argv": sys.argv, "task": task_id})
+    gpu = rt.hardware_info()
+    info = rt.update_run_info(
+      run_dir,
+      task=task_id,
+      experiment=cfg.agent.experiment_name,
+      device=device,
+      gpu_ids=cfg.gpu_ids,
+      num_envs=int(cfg.env.scene.num_envs),
+      max_iterations=int(cfg.agent.max_iterations),
+      seed=int(cfg.agent.seed),
+      logger=agent_cfg.get("logger"),
+      nan_guard=nan_guard,
+      git=rt.git_info(),
+      versions=rt.distribution_versions(),
+      hardware=gpu,
+      mujoco_gl=os.environ.get("MUJOCO_GL"),
+      resume=resume_meta,
+      started=rt.now_iso(),
+      retention={"keep_last": cfg.keep_last, "keep_every": cfg.keep_every, "keep_best": cfg.keep_best},
+    )
+    start = int(runner.current_learning_iteration)
+    print("=" * 78)
+    print(f"[contact-train] task={task_id}  device={device}  num_envs={cfg.env.scene.num_envs}  "
+          f"logger={agent_cfg.get('logger')}  nan_guard={nan_guard}")
+    print(f"[contact-train] run dir: {run_dir}")
+    print(f"[contact-train] iterations {start} .. {start + cfg.agent.max_iterations - 1} (save every {cfg.agent.save_interval})")
+    print(f"[contact-train] git: {json.dumps(info.get('git'))}")
+    v = info["versions"]
+    print(f"[contact-train] torch={v.get('torch')} mjlab={v.get('mjlab')} rsl-rl={v.get('rsl-rl-lib')} mujoco={v.get('mujoco')} warp={v.get('warp-lang')}")
+    for g in gpu.get("gpus", []):
+      print(f"[contact-train] GPU{g['index']}: {g['name']} {g['vram_gib']} GiB (sm_{g['capability']})")
+    if resume_meta:
+      print(f"[contact-train] resumed from {resume_meta['source']} (iter {resume_meta['source_iteration']}) -> starting at {start}")
+    print(f"[contact-train] TensorBoard: uv run tensorboard --logdir {Path(cfg.run_root)} --host 127.0.0.1 --port 6006")
+    print("=" * 78, flush=True)
+
+    if managed:
+      # First SIGINT/SIGTERM: stop after this iteration; a duplicate SIGINT
+      # (uv run / tmux double delivery) within 1 s is ignored; a later Ctrl-C
+      # raises KeyboardInterrupt (hard abort, exit 130).
+      rt.install_stop_handlers(runner.request_stop)
+    try:
+      runner.learn(num_learning_iterations=cfg.agent.max_iterations, init_at_random_ep_len=True)
+      print("[contact-train] finished.")
+    except TrainingStopped as e:
+      print(f"[contact-train] stopped cleanly on {e}; last checkpoint iteration {runner._last_saved_it}.")
+    code = 0
   except KeyboardInterrupt:
     print("[contact-train] aborted (second Ctrl-C). The last complete checkpoint is intact.")
     code = 130
   finally:
-    rt.update_run_info(run_dir, finished=rt.now_iso(), exit_code=code)
     try:
-      venv.close()
-    except Exception as e:  # noqa: BLE001
-      print(f"[WARN] env close failed: {e}")
+      rt.update_run_info(run_dir, finished=rt.now_iso(), exit_code=code)
+    finally:
+      close_quietly(closable)
   return code
 
 

@@ -16,6 +16,10 @@ Examples::
 All mjlab ``play`` flags are accepted (``--agent``, ``--checkpoint-file``,
 ``--wandb-run-path``, ``--num-envs``, ``--device``, ``--video``, ``--viewer``,
 ``--no-terminations`` ...). See :mod:`contact_rl.play_viewer` for the controls.
+
+The env (and its video recorder / EGL context) is closed in a ``finally``
+block, so a failing checkpoint load, a busy port or a viewer crash never
+leaves it open.
 """
 
 from __future__ import annotations
@@ -128,69 +132,77 @@ def run(task_id: str, cfg) -> None:
     print(f"[play] checkpoint: {ckpt}")
 
   env = ManagerBasedRlEnv(cfg=env_cfg, device=device, render_mode="rgb_array" if (cfg.video and trained) else None)
-  if cfg.video and trained and ckpt is not None:
-    vdir = ck.run_dir_of_checkpoint(ckpt) / "videos" / "play"
-    env = StreamingVideoRecorder(env, path_fn=lambda s: vdir / f"{ckpt.stem}_step{s}.mp4",
-                                 step_trigger=lambda s: s == 0, video_length=cfg.video_length)
-  venv = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+  closable = env
+  try:
+    if cfg.video and trained and ckpt is not None:
+      vdir = ck.run_dir_of_checkpoint(ckpt) / "videos" / "play"
+      env = StreamingVideoRecorder(env, path_fn=lambda s: vdir / f"{ckpt.stem}_step{s}.mp4",
+                                   step_trigger=lambda s: s == 0, video_length=cfg.video_length)
+      closable = env
+    venv = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    closable = venv
 
-  runner = None
-  if trained:
-    runner_cls = load_runner_cls(task_id) or MjlabOnPolicyRunner
-    runner = runner_cls(venv, asdict(agent_cfg), device=device)
-    runner.load(str(ckpt), load_cfg={"actor": True}, strict=True, map_location=device)
-    policy = runner.get_inference_policy(device=device)
-  else:
-    shape = venv.unwrapped.action_space.shape
-    zero = cfg.agent == "zero"
+    runner = None
+    if trained:
+      runner_cls = load_runner_cls(task_id) or MjlabOnPolicyRunner
+      runner = runner_cls(venv, asdict(agent_cfg), device=device)
+      runner.load(str(ckpt), load_cfg={"actor": True}, strict=True, map_location=device)
+      policy = runner.get_inference_policy(device=device)
+    else:
+      shape = venv.unwrapped.action_space.shape
+      zero = cfg.agent == "zero"
 
-    def policy(obs):  # noqa: ARG001
-      return torch.zeros(shape, device=device) if zero else 2 * torch.rand(shape, device=device) - 1
+      def policy(obs):  # noqa: ARG001
+        return torch.zeros(shape, device=device) if zero else 2 * torch.rand(shape, device=device) - 1
 
-  reset_recurrent_state(policy)
+    reset_recurrent_state(policy)
 
-  def load_policy(path: Path):
-    assert runner is not None
-    ck.validate_checkpoint(path)
-    runner.load(str(path), load_cfg={"actor": True}, strict=True, map_location=device)
-    p = runner.get_inference_policy(device=device)
-    reset_recurrent_state(p)
-    return p
+    def load_policy(path: Path):
+      assert runner is not None
+      ck.validate_checkpoint(path)
+      runner.load(str(path), load_cfg={"actor": True}, strict=True, map_location=device)
+      p = runner.get_inference_policy(device=device)
+      reset_recurrent_state(p)
+      return p
 
-  def list_ckpts() -> list[Path]:
-    if ckpt is None:
-      return []
-    run_dir = ck.run_dir_of_checkpoint(ckpt)
-    out = [p for _, p in ck.list_checkpoints(run_dir)]
-    best = ck.checkpoint_dir(run_dir) / ck.BEST_NAME
-    return ([best] if best.exists() else []) + out[::-1]
+    def list_ckpts() -> list[Path]:
+      if ckpt is None:
+        return []
+      run_dir = ck.run_dir_of_checkpoint(ckpt)
+      out = [p for _, p in ck.list_checkpoints(run_dir)]
+      best = ck.checkpoint_dir(run_dir) / ck.BEST_NAME
+      return ([best] if best.exists() else []) + out[::-1]
 
-  viewer = cfg.viewer
-  if viewer == "auto":
-    viewer = "native" if rt.has_display() else "viser"
-  if viewer == "native":
-    from mjlab.viewer import NativeMujocoViewer
+    viewer = cfg.viewer
+    if viewer == "auto":
+      viewer = "native" if rt.has_display() else "viser"
+    if viewer == "native":
+      from mjlab.viewer import NativeMujocoViewer
 
-    NativeMujocoViewer(_RecurrentResetEnv(venv, lambda: policy), policy).run()
-  else:
-    import viser
+      NativeMujocoViewer(_RecurrentResetEnv(venv, lambda: policy), policy).run()
+    else:
+      import viser
 
-    from contact_rl.play_viewer import ContactPlayViewer
+      from contact_rl.play_viewer import ContactPlayViewer
 
-    check_port(cfg.host, cfg.port)
-    server = viser.ViserServer(host=cfg.host, port=cfg.port, label="contact-play")
-    where = f"http://{cfg.host}:{cfg.port}"
-    print("=" * 70)
-    print(f"[play] Viser listening on {where}" + ("" if rt.is_loopback(cfg.host) else "  (PUBLIC, no auth!)"))
-    print(f"[play] from your laptop:  ssh -N -L {cfg.port}:127.0.0.1:{cfg.port} <user>@<vps>")
-    print(f"[play] then open          http://localhost:{cfg.port}")
-    print("=" * 70, flush=True)
+      check_port(cfg.host, cfg.port)
+      server = viser.ViserServer(host=cfg.host, port=cfg.port, label="contact-play")
+      where = f"http://{cfg.host}:{cfg.port}"
+      print("=" * 70)
+      print(f"[play] Viser listening on {where}" + ("" if rt.is_loopback(cfg.host) else "  (PUBLIC, no auth!)"))
+      print(f"[play] from your laptop:  ssh -N -L {cfg.port}:127.0.0.1:{cfg.port} <user>@<vps>")
+      print(f"[play] then open          http://localhost:{cfg.port}")
+      print("=" * 70, flush=True)
+      try:
+        ContactPlayViewer(venv, policy, viser_server=server, load_policy=load_policy if trained else None,
+                          checkpoints=list_ckpts, current_checkpoint=ckpt).run()
+      finally:
+        server.stop()
+  finally:
     try:
-      ContactPlayViewer(venv, policy, viser_server=server, load_policy=load_policy if trained else None,
-                        checkpoints=list_ckpts, current_checkpoint=ckpt).run()
-    finally:
-      server.stop()
-  venv.close()
+      closable.close()
+    except Exception as e:  # noqa: BLE001  (never mask the original error)
+      print(f"[WARN] env close failed: {e}", file=sys.stderr)
 
 
 def parse_args(argv: list[str] | None = None):

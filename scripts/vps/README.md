@@ -25,12 +25,13 @@ Typical session:
 # laptop
 ssh user@vps
 # VPS
-git clone <repo> rl && cd rl
+git clone -b audit/paper-alignment https://github.com/KEHSANN/rl.git rl && cd rl
 bash scripts/vps/setup.sh
 bash scripts/vps/train_tmux.sh Mjlab-Contact-Flat-Unitree-Go2      # paper default: 8192 envs
 # lower-VRAM GPU: append --env.scene.num-envs 4096
 bash scripts/vps/tensorboard.sh
-bash scripts/vps/watch_tmux.sh            # newest run
+# wait until train.log prints the run dir, then (latest = newest run at start time):
+bash scripts/vps/watch_tmux.sh
 exit                                      # training keeps running
 # laptop
 bash scripts/vps/tunnel.sh user@vps       # http://localhost:6006
