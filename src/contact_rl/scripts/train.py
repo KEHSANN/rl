@@ -21,15 +21,25 @@ Examples::
   uv run contact-train Mjlab-Contact-Flat-Unitree-Go2          # paper default: 8192 envs
   uv run contact-train Mjlab-Contact-Flat-Unitree-Go2 --env.scene.num-envs 4096   # lower-VRAM fallback
 
+On the VPS run it with ``UV_NO_SYNC=1`` (exported by ``scripts/vps/common.sh``
+and the systemd units) or as ``uv run --no-sync contact-train ...``: a plain
+``uv run`` re-syncs the env without ``--extra cu128`` and swaps out the CUDA
+torch build that ``scripts/vps/setup.sh`` installed.
+
 ``--enable-nan-guard True`` turns on mjlab's simulation NaN guard
 (``env.sim.nan_guard.enabled``), exactly like mjlab's own ``train`` CLI.
 
-GPUs: ``--gpu-ids 0`` (default) / ``--gpu-ids 1`` / ``--gpu-ids all`` with one
-visible GPU all train in this process with full run management. Only when
-more than one GPU is actually selected (``--gpu-ids 0 1``, or ``all`` with
-several visible GPUs) is training delegated to mjlab's torchrunx launcher
-with a plain mjlab ``TrainConfig`` (legacy logs/rsl_rl layout, no run
-management; the contact-train-only flags are ignored with a warning).
+GPUs: mjlab parses collections with Python syntax
+(``tyro.conf.UsePythonSyntaxForLiteralCollections``), so ``--gpu-ids`` takes
+one quoted list literal: ``--gpu-ids "[0]"`` (default), ``--gpu-ids "[1]"``,
+``--gpu-ids "[0, 1]"`` or ``--gpu-ids all`` (``--gpu-ids 0 1`` is *not*
+accepted). The ids index into ``CUDA_VISIBLE_DEVICES``. A single selected GPU
+-- including ``all`` on a machine with one visible GPU -- trains in this
+process with full run management. Only when more than one GPU is actually
+selected (``"[0, 1]"``, or ``all`` with several visible GPUs) is training
+delegated to mjlab's torchrunx launcher with a plain mjlab ``TrainConfig``
+(legacy logs/rsl_rl layout, no run management; the contact-train-only flags
+are ignored with a warning).
 
 run_info.json: written as soon as the run dir exists (``status="starting"``),
 updated to ``"running"`` once training starts, and always finalised with
@@ -38,23 +48,40 @@ updated to ``"running"`` once training starts, and always finalised with
 run can never be recorded as a success; the traceback also goes to
 ``logs/error.txt``.
 
-Exit codes: 0 = finished or stopped cleanly (SIGINT/SIGTERM), 130 = hard abort
-(second Ctrl-C), 1 = any other error (the traceback is re-raised). The env is
-closed even if env construction, the runner, the resume load or training
-itself fails.
+Signals: from the start of :func:`run_contact_train` until the runner's
+graceful-stop handlers take over, :class:`StartupSignalGuard` is installed.
+The first SIGINT / SIGTERM during startup (heavy imports, CUDA init, env
+construction / Warp kernel compilation, runner construction, resume load)
+raises :class:`StartupStop`; the run is finalised as ``status="stopped"``
+(exit 0, no checkpoint) instead of being left at ``"starting"`` (SIGTERM used
+to kill the process without running any cleanup) or recorded as a hard abort
+(first Ctrl-C). Repeated signals during the stop are ignored. During training
+the first SIGINT / SIGTERM finishes the iteration and writes a checkpoint, a
+duplicate SIGINT within 1 s is ignored and a later Ctrl-C aborts (exit 130).
+While ``run_info.json`` is finalised and the env is closed, SIGINT / SIGTERM
+are ignored so the final status is written exactly once and never torn;
+SIGKILL (systemd ``TimeoutStopSec``) still ends a hung cleanup.
+
+Exit codes: 0 = finished or stopped cleanly (SIGINT/SIGTERM, also during
+startup), 130 = hard abort (second Ctrl-C during training), 1 = any other
+error (the traceback is re-raised). The env is closed even if env
+construction, the runner, the resume load or training itself fails.
 """
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import os
+import signal
 import sys
 import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
+from contact_rl.utils import runtime as rt  # torch / mujoco free
 from contact_rl.utils.runtime import configure_headless_rendering
 
 configure_headless_rendering()  # before anything can import mujoco
@@ -159,6 +186,148 @@ def ignored_contact_flags(cfg: Any, defaults: Any) -> list[str]:
   return [n for n in CONTACT_ONLY_FLAGS if getattr(cfg, n, None) != getattr(defaults, n, None)]
 
 
+# ------------------------------------------------ startup-stop / finalisation
+
+
+def _sig_name(signum: int) -> str:
+  try:
+    return signal.Signals(signum).name
+  except ValueError:
+    return f"signal {signum}"
+
+
+class StartupStop(BaseException):
+  """SIGINT / SIGTERM received before the runner's graceful-stop handlers were
+  installed -- typically while the env is being built, which can take minutes
+  on a first run while Warp compiles its kernels.
+
+  Derives from ``BaseException`` (like ``KeyboardInterrupt``) so that broad
+  ``except Exception`` blocks in mjlab, MuJoCo-Warp or our own helpers cannot
+  swallow the stop request: it always unwinds to :func:`run_contact_train`,
+  which records ``status="stopped"``."""
+
+  def __init__(self, signal_name: str, phase: str = "startup"):
+    super().__init__(f"{signal_name} during {phase}")
+    self.signal_name = signal_name
+    self.phase = phase
+
+
+class StartupSignalGuard:
+  """SIGINT / SIGTERM policy while contact-train starts up.
+
+  Without it the default dispositions applied: SIGTERM (``systemctl --user
+  stop``, ``kill``) terminated the process at once, skipping every ``finally``
+  block, so ``run_info.json`` stayed at ``status="starting"``; the first
+  Ctrl-C raised ``KeyboardInterrupt`` and was recorded as a hard abort (130)
+  although nothing had started.
+
+  * The first SIGINT / SIGTERM raises :class:`StartupStop` (clean stop).
+  * Every later SIGINT / SIGTERM is ignored with a message: a stop is already
+    in progress, and a duplicate delivery (``uv run`` forwarding the signal
+    that the terminal also sent, ``tmux send-keys C-c``, systemd signalling
+    both uv and its child) must neither interrupt the cleanup nor turn the
+    stop into an abort.
+  * SIGHUP is ignored (dropped SSH session), as during training.
+
+  ``phase`` only labels the stop reason (``"<SIGNAL> during <phase>"``).
+  """
+
+  def __init__(self) -> None:
+    self.signal_name: str | None = None
+    self.ignored = 0
+    self.phase = "startup"
+
+  def __call__(self, signum: int, _frame: Any = None) -> None:
+    name = _sig_name(signum)
+    if self.signal_name is not None:
+      self.ignored += 1
+      print(f"[INFO] {name} ignored: already stopping on {self.signal_name}.", file=sys.stderr, flush=True)
+      return
+    self.signal_name = name
+    raise StartupStop(name, self.phase)
+
+  def install(self) -> "StartupSignalGuard":
+    """Install for SIGINT / SIGTERM (and ignore SIGHUP). Signal handlers can
+    only be set from the main thread; elsewhere this warns and does nothing."""
+    try:
+      signal.signal(signal.SIGINT, self)
+      signal.signal(signal.SIGTERM, self)
+      if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    except ValueError as e:  # not the main thread
+      print(f"[WARN] startup signal guard not installed: {e}", file=sys.stderr)
+    return self
+
+
+@contextlib.contextmanager
+def stop_signals_ignored(what: str = "finalising the run") -> Iterator[None]:
+  """Ignore SIGINT / SIGTERM inside the block (the final ``run_info.json``
+  write and the env close), so a late or duplicate signal can neither tear
+  the finalisation half-way nor cause a second one. On exit the process
+  defaults are restored (Ctrl-C -> ``KeyboardInterrupt``, SIGTERM ->
+  terminate): the run is finalised, nothing is left to protect. SIGKILL
+  (e.g. systemd's ``TimeoutStopSec``) still ends a hung cleanup."""
+
+  def _ignore(signum: int, _frame: Any = None) -> None:
+    print(
+      f"[INFO] {_sig_name(signum)} ignored while {what} (kill -9 {os.getpid()} to force).",
+      file=sys.stderr,
+      flush=True,
+    )
+
+  def _set(int_handler: Any, term_handler: Any) -> None:
+    try:
+      signal.signal(signal.SIGINT, int_handler)
+      signal.signal(signal.SIGTERM, term_handler)
+    except ValueError:  # not the main thread: leave the handlers alone
+      pass
+
+  _set(_ignore, _ignore)
+  try:
+    yield
+  finally:
+    _set(signal.default_int_handler, signal.SIG_DFL)
+
+
+@dataclass
+class RunOutcome:
+  """What :func:`run_contact_train` records in ``run_info.json`` and returns."""
+
+  code: int = 1
+  error: str | None = None
+  stop_reason: str | None = None
+  finalized: bool = False
+
+  @property
+  def status(self) -> str:
+    return run_status(self.code, self.stop_reason)
+
+
+def finalize_run_info(run_dir: Path | None, outcome: RunOutcome, last_checkpoint_iteration: int | None = None) -> bool:
+  """Record the final status in ``run_info.json`` exactly once.
+
+  Returns ``False`` without writing if there is no run dir yet (the process
+  was stopped / failed before it was created) or the run is already
+  finalised. The write itself is atomic (:func:`runtime.write_json`); a write
+  failure is reported but never masks the real error, and is not retried."""
+  if run_dir is None or outcome.finalized:
+    return False
+  outcome.finalized = True
+  try:
+    rt.update_run_info(
+      run_dir,
+      finished=rt.now_iso(),
+      exit_code=outcome.code,
+      status=outcome.status,
+      error=outcome.error,
+      stop_reason=outcome.stop_reason,
+      last_checkpoint_iteration=last_checkpoint_iteration,
+    )
+  except Exception as e:  # noqa: BLE001 - never mask the real error
+    print(f"[WARN] could not finalise run_info.json: {e}")
+  return True
+
+
 def _pick_device(cfg) -> str:
   from contact_rl.utils.runtime import resolve_device
 
@@ -196,46 +365,49 @@ def _legacy_resume_path(cfg) -> Path | None:
 
 
 def run_contact_train(task_id: str, cfg) -> int:
-  import torch
-
-  import contact_rl
-  from mjlab.envs import ManagerBasedRlEnv
-  from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
-  from mjlab.tasks.registry import load_runner_cls
-  from mjlab.utils.os import dump_yaml
-  from mjlab.utils.torch import configure_torch_backends
-
-  from contact_rl.tasks.contact.config.go2.runner import ContactOnPolicyRunner, TrainingStopped
-  from contact_rl.utils import checkpoints as ck
-  from contact_rl.utils import runtime as rt
-  from contact_rl.utils.video import StreamingVideoRecorder
-
-  device = _pick_device(cfg)
-  rt.set_egl_device_for(device)
-  if device.startswith("cuda"):
-    torch.cuda.set_device(device)
-  configure_torch_backends()
-
-  resume_path: Path | None = None
-  if cfg.resume_from:
-    resume_path = ck.resolve_checkpoint(cfg.resume_from, Path(cfg.run_root))
-  else:
-    resume_path = _legacy_resume_path(cfg)
-
-  run_dir = ck.create_run_dir(cfg.run_root, cfg.agent.experiment_name, cfg.agent.run_name or None)
-  rt.install_console_tee(run_dir / "logs" / "train.log")
-  rt.update_run_info(run_dir, status="starting", task=task_id, started=rt.now_iso(), pid=os.getpid(), argv=sys.argv)
-
-  # Everything from here on runs under try/finally: a failing env
-  # construction, runner construction, resume load, CUDA OOM or NaN still
-  # closes whatever was built (EGL context, ffmpeg) and records the real
-  # status / exit code / error in run_info.json.
+  # The startup guard goes in first, before anything slow (heavy imports, CUDA
+  # init, resume resolution, env construction): from here on SIGINT / SIGTERM
+  # always unwind through the handlers below, so run_info.json is finalised
+  # (see the module docstring, "Signals").
+  guard = StartupSignalGuard()
+  outcome = RunOutcome()
+  run_dir: Path | None = None
   closable: Any = None
   runner = None
-  code = 1
-  error: str | None = None
-  stop_reason: str | None = None
   try:
+    guard.install()
+    import torch
+
+    import contact_rl
+    from mjlab.envs import ManagerBasedRlEnv
+    from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
+    from mjlab.tasks.registry import load_runner_cls
+    from mjlab.utils.os import dump_yaml
+    from mjlab.utils.torch import configure_torch_backends
+
+    from contact_rl.tasks.contact.config.go2.runner import ContactOnPolicyRunner, TrainingStopped
+    from contact_rl.utils import checkpoints as ck
+    from contact_rl.utils.video import StreamingVideoRecorder
+
+    device = _pick_device(cfg)
+    rt.set_egl_device_for(device)
+    if device.startswith("cuda"):
+      torch.cuda.set_device(device)
+    configure_torch_backends()
+
+    resume_path: Path | None = None
+    if cfg.resume_from:
+      resume_path = ck.resolve_checkpoint(cfg.resume_from, Path(cfg.run_root))
+    else:
+      resume_path = _legacy_resume_path(cfg)
+
+    run_dir = ck.create_run_dir(cfg.run_root, cfg.agent.experiment_name, cfg.agent.run_name or None)
+    rt.install_console_tee(run_dir / "logs" / "train.log")
+    rt.update_run_info(run_dir, status="starting", task=task_id, started=rt.now_iso(), pid=os.getpid(), argv=sys.argv)
+
+    # From here on a failing env construction, runner construction, resume
+    # load, CUDA OOM or NaN still closes whatever was built (EGL context,
+    # ffmpeg) and records the real status / exit code / error.
     cfg.env.seed = cfg.agent.seed
     nan_guard = apply_nan_guard(cfg)  # must happen before the env (and its sim) is built
     env = ManagerBasedRlEnv(cfg=cfg.env, device=device, render_mode="rgb_array" if cfg.video else None)
@@ -322,46 +494,45 @@ def run_contact_train(task_id: str, cfg) -> int:
     if managed:
       # First SIGINT/SIGTERM: stop after this iteration; a duplicate SIGINT
       # (uv run / tmux double delivery) within 1 s is ignored; a later Ctrl-C
-      # raises KeyboardInterrupt (hard abort, exit 130).
+      # raises KeyboardInterrupt (hard abort, exit 130). Replaces the guard.
       rt.install_stop_handlers(runner.request_stop)
+    else:
+      # No graceful stop without ContactOnPolicyRunner: the guard stays and a
+      # signal interrupts training immediately (recorded as "stopped").
+      guard.phase = "training (runner without graceful stop)"
     try:
       runner.learn(num_learning_iterations=cfg.agent.max_iterations, init_at_random_ep_len=True)
       print("[contact-train] finished.")
     except TrainingStopped as e:
-      stop_reason = str(e) or "stop requested"
+      outcome.stop_reason = str(e) or "stop requested"
       print(f"[contact-train] stopped cleanly on {e}; last checkpoint iteration {runner._last_saved_it}.")
-    code = 0
+    outcome.code = 0
+  except StartupStop as e:
+    outcome.code = 0
+    outcome.stop_reason = str(e)
+    where = "before training started (no checkpoint written)" if e.phase == "startup" else f"during {e.phase}"
+    print(f"[contact-train] stopped on {e.signal_name} {where}.", flush=True)
   except KeyboardInterrupt:
     print("[contact-train] aborted (second Ctrl-C). The last complete checkpoint is intact.")
-    code = 130
-    error = "KeyboardInterrupt (hard abort)"
+    outcome.code = 130
+    outcome.error = "KeyboardInterrupt (hard abort)"
   except BaseException as e:
     # Record the failure, then re-raise so the traceback is shown and the
     # process exits non-zero (SystemExit keeps its own code).
-    code = e.code if isinstance(e, SystemExit) and isinstance(e.code, int) and e.code != 0 else 1
-    error = f"{type(e).__name__}: {e}"
-    try:
-      (run_dir / "logs").mkdir(parents=True, exist_ok=True)
-      (run_dir / "logs" / "error.txt").write_text(traceback.format_exc())
-    except Exception:
-      pass
+    outcome.code = e.code if isinstance(e, SystemExit) and isinstance(e.code, int) and e.code != 0 else 1
+    outcome.error = f"{type(e).__name__}: {e}"
+    if run_dir is not None:
+      try:
+        (run_dir / "logs").mkdir(parents=True, exist_ok=True)
+        (run_dir / "logs" / "error.txt").write_text(traceback.format_exc())
+      except Exception:
+        pass
     raise
   finally:
-    try:
-      rt.update_run_info(
-        run_dir,
-        finished=rt.now_iso(),
-        exit_code=code,
-        status=run_status(code, stop_reason),
-        error=error,
-        stop_reason=stop_reason,
-        last_checkpoint_iteration=getattr(runner, "_last_saved_it", None),
-      )
-    except Exception as e:  # noqa: BLE001 - never mask the real error
-      print(f"[WARN] could not finalise run_info.json: {e}")
-    finally:
+    with stop_signals_ignored("finalising run_info.json / closing the env"):
+      finalize_run_info(run_dir, outcome, getattr(runner, "_last_saved_it", None))
       close_quietly(closable)
-  return code
+  return outcome.code
 
 
 def parse_args(argv: list[str] | None = None):

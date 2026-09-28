@@ -58,8 +58,19 @@ is narrowed to Linux x86_64 (`[tool.uv] environments`).
 ```bash
 uv sync --extra cu128 --python 3.12 --frozen   # Linux x86_64 + NVIDIA GPU
 uv sync --extra cpu --frozen                   # CPU smoke tests only
+export UV_NO_SYNC=1                            # see below
 uv run contact-doctor                          # machine-readiness report
 ```
+
+**`UV_NO_SYNC=1`:** `uv run` normally re-syncs the project env before every
+command, and without `--extra cu128` that sync targets the *no-extra*
+resolution: it silently replaces the CUDA torch build installed above with a
+different torch wheel. Sync once, explicitly (`uv sync --extra ...` or
+`scripts/vps/setup.sh`), then run everything with `UV_NO_SYNC=1` exported or
+as `uv run --no-sync ...` (`--no-sync` implies `--frozen`). The VPS scripts
+(`scripts/vps/common.sh`, also inside tmux sessions) and the systemd units set
+it for you. Re-sync after a `git pull` that changes `uv.lock`. All `uv run`
+commands below assume it is set.
 
 Dependency-resolution notes (do not undo; details in `pyproject.toml`):
 `mujoco-warp==3.5.0.2` comes from PyPI rather than mjlab's git rev, and the
@@ -101,7 +112,11 @@ All mjlab `TrainConfig` flags work (`--env.*`, `--agent.*`, `--video`,
 `--resume-from`, `--device`, `--run-root`, `--keep-last`, `--keep-every`,
 `--keep-best`, `--export-onnx`. First Ctrl-C / SIGTERM: finish the iteration,
 save a checkpoint, exit. A duplicate SIGINT within 1 s (e.g. from `uv run`) is
-ignored; a later Ctrl-C aborts hard (exit 130).
+ignored; a later Ctrl-C aborts hard (exit 130). A Ctrl-C / SIGTERM *before*
+training has started (e.g. while the env is being built and Warp compiles its
+kernels) is a clean stop too: exit 0, `run_info.json` finalised as
+`status: "stopped"` (no checkpoint yet), further signals during that stop are
+ignored.
 
 ## Evaluation
 
@@ -153,12 +168,24 @@ throughput to help pick `num_envs`.
 
 ## Checkpoints
 
-`runs/<experiment>/<timestamp>[_name]/` contains `checkpoints/`
-(`model_<iter>.pt`, `best.pt`), `config/`, `logs/train.log`,
-`exported/policy.onnx`, `metrics/`, `videos/` and `run_info.json`. Retention
-keeps the newest `--keep-last` (5), multiples of `--keep-every` (1000) and
-`best.pt` (by mean episode reward). Selectors: a file, a run dir,
-`run_dir:<iter>|best|latest`, `latest`, `best`. `runs/` is git-ignored.
+```
+runs/<experiment>/<timestamp>[_name]/      # e.g. runs/go2_contact/2026-01-31_12-00-00
+  run_info.json                            # status: starting|running|finished|stopped|aborted|failed
+  checkpoints/model_<iter>.pt              # atomic writes (.tmp + rename)
+  checkpoints/latest.pt                    # symlink (copy if symlinks fail) to the newest model_<iter>.pt
+  checkpoints/best.pt                      # copy of the best checkpoint (mean episode reward)
+  checkpoints/index.json                   # every saved iteration + best
+  config/  logs/train.log  logs/error.txt (on crash)  exported/policy.onnx  metrics/  videos/
+```
+
+Retention keeps the newest `--keep-last` (5), multiples of `--keep-every`
+(1000) and the best iteration. Selectors (`--checkpoint`, `--resume-from`):
+a `.pt` file, a run dir (= its latest), `<run_dir>:<iter>|best|latest`, or
+`latest` / `best` (newest run under `runs/`). Corrupt or
+half-written files are skipped by `latest`. mjlab's legacy
+`logs/rsl_rl/<experiment>/<run>/model_<iter>.pt` layout is only produced by a
+multi-GPU run (see below) and is still readable (`--checkpoint-file`,
+`--agent.resume True`). `runs/` and `logs/` are git-ignored.
 
 ## Video
 
@@ -189,10 +216,16 @@ uv run tensorboard --logdir runs --host 127.0.0.1 --port 6006
 
 - **8192** envs = paper / project default (`PAPER_NUM_ENVS` in `env_cfgs.py`).
 - **4096** = lower-VRAM fallback; pass `--env.scene.num-envs 4096` explicitly.
-- `--gpu-ids 0` (default), `--gpu-ids 1`, and `--gpu-ids all` on a one-GPU
-  machine train in-process with full run management. Only when more than one
-  GPU is actually selected is training delegated to mjlab's multi-GPU launcher
-  (legacy `logs/rsl_rl` layout, no run management).
+- `--gpu-ids` takes a quoted Python list (mjlab's tyro config uses
+  `UsePythonSyntaxForLiteralCollections`): `--gpu-ids "[0]"` (default),
+  `--gpu-ids "[1]"`, `--gpu-ids "[0, 1]"`, or `--gpu-ids all`. `--gpu-ids 0 1`
+  is **not** valid. The ids index into `CUDA_VISIBLE_DEVICES`; alternatively
+  `CUDA_VISIBLE_DEVICES=1` or `--device cuda:1`.
+- One selected GPU (including `all` on a one-GPU machine) trains in-process
+  with full run management. Only when more than one GPU is actually selected
+  is training delegated to mjlab's multi-GPU launcher (legacy `logs/rsl_rl`
+  layout, no run management; contact-train-only flags are ignored with a
+  warning).
 
 ## VPS
 
@@ -204,12 +237,16 @@ optional systemd user units (which use the 8192 default).
 ## Testing
 
 ```bash
-uv run --with pytest pytest tests -q
+UV_NO_SYNC=1 uv run --with pytest pytest tests -q   # after the env was synced once
 ```
 
 - **Lightweight / local** (no GPU): planner math, checkpoint lifecycle, episode
   metrics, watcher logic, CLI helpers, VPS script syntax / tmux exit codes,
-  systemd and `.gitignore` static checks (`tests/test_vps_scripts.py`).
+  systemd and `.gitignore` static checks (`tests/test_vps_scripts.py`), and
+  the second-pass regressions (`tests/test_second_pass_regressions.py`: VPS
+  scripts against fake `uv` / `tmux`, `UV_NO_SYNC` propagation, systemd unit
+  settings, `contact-train` startup stop against stubbed torch / mjlab,
+  atomic JSON, duplicate Ctrl-C, run lock, ONNX temp cleanup).
 - **Linux/VPS-only**: anything importing mjlab / MuJoCo-Warp (the lock is
   Linux x86_64 only), EGL rendering, `contact-doctor` end to end.
 - **GPU-dependent**: training, `contact-bench`, full `contact-eval` runs.

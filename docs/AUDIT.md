@@ -68,6 +68,7 @@ so no simulation, training, or throughput measurement could be run there.
 
 ```bash
 uv sync --extra cu128 --python 3.12 --frozen
+export UV_NO_SYNC=1        # a plain `uv run` would re-sync without cu128 and swap torch
 uv run --with pytest pytest tests -q                       # unit tests
 uv run contact-bench --num-envs 2048 4096 8192             # hardware + throughput
 uv run contact-train Mjlab-Contact-Flat-Unitree-Go2 --env.scene.num-envs 8192 \
@@ -75,8 +76,43 @@ uv run contact-train Mjlab-Contact-Flat-Unitree-Go2 --env.scene.num-envs 8192 \
 uv run contact-train Mjlab-Contact-Flat-Unitree-Go2-Improved --env.scene.num-envs 8192 \
     --agent.logger tensorboard                             # experimental variant
 uv run contact-eval --task Mjlab-Contact-Flat-Unitree-Go2 \
-    --checkpoint-file logs/rsl_rl/go2_contact/<run>/model_<it>.pt   # Fig. 6
+    --checkpoint runs/go2_contact/<run>:best                # Fig. 6 (or .../checkpoints/model_<it>.pt)
 ```
 
-Seed: `agent.seed = 42` (override with `--agent.seed`). Pre-audit baseline:
-`git checkout 23ad625`.
+Checkpoints are written by `contact-train` to
+`runs/<experiment>/<timestamp>/checkpoints/` (`model_<it>.pt`, `latest.pt`,
+`best.pt`, `index.json`); the `logs/rsl_rl/...` layout used by earlier
+versions of this document is only produced by a multi-GPU hand-off to mjlab's
+launcher. Seed: `agent.seed = 42` (override with `--agent.seed`). Pre-audit
+baseline: `git checkout 23ad625`.
+
+## 5. Second pass: VPS / runtime robustness
+
+Engineering fixes (no change to the task, rewards or training algorithm):
+
+| # | Finding | Fix |
+| --- | --- | --- |
+| S1 | SIGTERM (`systemctl --user stop`) while the env was being built killed `contact-train` without running any cleanup, leaving `run_info.json` at `status: "starting"`; a first Ctrl-C at that point was recorded as a hard abort (130). | `StartupSignalGuard` is installed at the start of `run_contact_train`: the first SIGINT / SIGTERM raises `StartupStop` (a `BaseException`, so library `except Exception` blocks cannot swallow it), the run is finalised as `stopped` with exit 0; repeated signals are ignored. The final `run_info.json` write and env close run with SIGINT / SIGTERM ignored, so the status is written exactly once (`finalize_run_info`, atomic `write_json`). |
+| S2 | Plain `uv run` re-synced the env without `--extra cu128` and replaced the CUDA torch build. | `UV_NO_SYNC=1` exported by `scripts/vps/common.sh`, forwarded into tmux sessions, set in all systemd units; `setup.sh` is the only sync (`EXTRA=cpu` supported). |
+| S3 | VPS wrappers took a leading option as checkpoint / run / logdir (`play.sh --num-envs 16`); `train_tmux.sh` started without a task. | Optional first argument only if it does not start with `-`; `train_tmux.sh` exits 2 without a task. |
+| S4 | systemd user units depended on `network-online.target` (not provided by user managers), buffered stdout. | Dependency removed; `PYTHONUNBUFFERED=1`; TensorBoard unit gets `TimeoutStopSec` / `RestartSec`. |
+| S5 | Docs: `--gpu-ids 0 1` (invalid with mjlab's `UsePythonSyntaxForLiteralCollections`), stale `logs/rsl_rl` checkpoint paths. | `--gpu-ids "[0, 1]"`, `runs/<exp>/<run>/checkpoints/` everywhere. |
+
+**rsl-rl 5.0.1 compatibility (source review, not executed).** The project
+runner and entry points were compared against upstream `rsl-rl` tag `v5.0.1`
+(`runners/on_policy_runner.py`, `utils/logger.py`, `algorithms/ppo.py`,
+`models/rnn_model.py`) and the vendored mjlab runner: `OnPolicyRunner(env,
+train_cfg, log_dir, device)`, `load(path, load_cfg, strict, map_location)`
+(with `load_cfg=None` the iteration is restored, which `load_for_resume`
+relies on before continuing at `iter + 1`), `current_learning_iteration`
+being set to `it` after each update (the stop checkpoint therefore stores
+`iter = it`), the keyword-only `Logger.log(it=..., collect_time=...,
+learn_time=..., loss_dict=..., learning_rate=...)` call wrapped by the runner,
+the lazily created `logger.writer` / `logger_type`, `rewbuffer` / `lenbuffer`,
+`stop_logging_writer`, `alg.entropy_coef`, `alg.storage.values / returns`,
+`alg.save()` keys (`actor_state_dict`, `critic_state_dict`,
+`optimizer_state_dict`) and the GRU `_OnnxRNNModel.forward` returning
+`(actions, h, None)` with two output names (handled by `onnx_compat`). No
+incompatibility was found. This is a static check only.
+
+Verification of this pass: see `docs/VPS_READINESS_STATUS.md`.
