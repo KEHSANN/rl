@@ -13,7 +13,13 @@ start_tmux() {  # start_tmux <session> <command...>
   if tmux has-session -t "$s" 2>/dev/null; then
     echo "tmux session '$s' already exists: tmux attach -t $s" >&2; exit 1
   fi
-  # 'exec bash' keeps the window open after the command ends so errors stay visible.
-  tmux new-session -d -s "$s" -c "$REPO" "$(printf '%q ' "$@"); echo; echo '[exited with' \$? ']'; exec bash"
+  # The command's exit code is captured *immediately* (a later `echo` would
+  # otherwise reset $? to 0 and always report success). 'exec bash' keeps the
+  # window open after the command ends so errors stay visible.
+  tmux new-session -d -s "$s" -c "$REPO" "$(tmux_wrap "$@")"
   echo "started tmux session '$s'  ->  tmux attach -t $s   (detach: Ctrl-b d)"
+}
+tmux_wrap() {  # shell snippet: run <command...>, report its real exit code, keep a shell
+  printf '%q ' "$@"
+  printf '%s' '; rc=$?; echo; echo "[exited with $rc]"; exec bash'
 }

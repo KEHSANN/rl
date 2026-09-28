@@ -5,6 +5,8 @@
 #   systemctl --user daemon-reload
 #   systemctl --user start contact-train@Mjlab-Contact-Flat-Unitree-Go2
 #   journalctl --user -u contact-train@Mjlab-Contact-Flat-Unitree-Go2 -f
+# Uses the task's own num_envs (paper default 8192). On a lower-VRAM GPU add
+# `--env.scene.num-envs 4096` to ExecStart (or a drop-in via `systemctl --user edit`).
 # `systemctl --user stop` sends SIGTERM -> checkpoint -> clean exit.
 [Unit]
 Description=contact-rl training (%i)
@@ -15,7 +17,7 @@ Type=simple
 WorkingDirectory=%h/rl
 Environment=MUJOCO_GL=egl
 Environment=PYOPENGL_PLATFORM=egl
-ExecStart=%h/.local/bin/uv run contact-train %i --env.scene.num-envs 4096
+ExecStart=%h/.local/bin/uv run contact-train %i
 KillSignal=SIGTERM
 TimeoutStopSec=300
 Restart=no
