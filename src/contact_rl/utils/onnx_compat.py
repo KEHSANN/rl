@@ -9,7 +9,8 @@ with 3 names and is fine.
 
 Fix: wrap the export module so ``None`` outputs are dropped before tracing.
 Nothing in rsl-rl is modified; training is untouched (the wrapper only exists
-on the CPU copy that ``as_onnx()`` creates for export).
+on the CPU copy that ``as_onnx()`` creates for export). MLP policies return a
+single tensor and pass through unchanged.
 """
 
 from __future__ import annotations
@@ -65,7 +66,9 @@ def make_exportable(onnx_model: nn.Module) -> nn.Module:
 
 def export_policy_onnx(policy: Any, path: str, filename: str = "policy.onnx", verbose: bool = False) -> str:
   """Export ``policy`` (an rsl-rl model with ``as_onnx``) to ``path/filename``
-  with the legacy exporter (``dynamo=False``, as mjlab does)."""
+  with the legacy exporter (``dynamo=False``, as mjlab does). The file is
+  written to ``<filename>.tmp`` and renamed on success; a failed export never
+  leaves a partial ``.tmp`` behind and never replaces a previous good file."""
   onnx_model = policy.as_onnx(verbose=verbose)
   onnx_model.to("cpu")
   onnx_model.eval()
@@ -83,10 +86,19 @@ def export_policy_onnx(policy: Any, path: str, filename: str = "policy.onnx", ve
     dynamic_axes={},
   )
   try:
-    torch.onnx.export(model, model.get_dummy_inputs(), tmp, dynamo=False, **kwargs)
-  except TypeError:  # torch without the ``dynamo`` kwarg
-    torch.onnx.export(model, model.get_dummy_inputs(), tmp, **kwargs)
-  os.replace(tmp, out)
+    try:
+      torch.onnx.export(model, model.get_dummy_inputs(), tmp, dynamo=False, **kwargs)
+    except TypeError as e:  # torch without the ``dynamo`` kwarg
+      if "dynamo" not in str(e):
+        raise
+      torch.onnx.export(model, model.get_dummy_inputs(), tmp, **kwargs)
+    os.replace(tmp, out)
+  except BaseException:
+    try:
+      os.remove(tmp)
+    except OSError:
+      pass
+    raise
   return out
 
 

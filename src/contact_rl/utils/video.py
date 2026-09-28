@@ -8,7 +8,10 @@ keeps every frame of a clip in a Python list before encoding.
 
 Encoder failures raise :class:`VideoEncodeError` (with ffmpeg's stderr);
 callers that must not die because of a video (training, the watcher) catch it
-and log it explicitly.
+and log it explicitly. :class:`StreamingVideoRecorder` goes further: *any*
+exception raised while rendering or encoding a training clip (EGL errors, a
+full disk, a bad path) disables that clip and is logged, but never reaches the
+training loop.
 """
 
 from __future__ import annotations
@@ -92,6 +95,7 @@ class StreamingVideoWriter:
     try:
       self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self._err)
     except OSError as e:
+      self._close_err()
       raise VideoEncodeError(f"could not start ffmpeg ({exe}): {e}") from e
 
   def _stderr(self) -> str:
@@ -102,6 +106,15 @@ class StreamingVideoWriter:
       return self._err.read().decode(errors="replace").strip()
     except Exception:
       return ""
+
+  def _close_err(self) -> None:
+    """Close the stderr temp file (one fd per clip; must never leak)."""
+    err, self._err = self._err, None
+    if err is not None:
+      try:
+        err.close()
+      except Exception:
+        pass
 
   def add(self, frame: np.ndarray) -> None:
     frame = to_uint8_rgb(frame)
@@ -129,10 +142,12 @@ class StreamingVideoWriter:
         pass
       self._proc = None
     self._part.unlink(missing_ok=True)
+    self._close_err()
 
   def close(self) -> Path | None:
     """Finalise; returns the MP4 path, or None if no frame was written."""
     if self._proc is None:
+      self._close_err()
       return self.path if (self.frames and self.path.exists()) else None
     proc, self._proc = self._proc, None
     try:
@@ -142,14 +157,15 @@ class StreamingVideoWriter:
     except Exception as e:
       proc.kill()
       self._part.unlink(missing_ok=True)
+      self._close_err()
       raise VideoEncodeError(f"ffmpeg did not finish {self.path}: {e}") from e
     if rc != 0 or not self._part.exists():
       self.failed = self._stderr() or f"exit code {rc}"
       self._part.unlink(missing_ok=True)
+      self._close_err()
       raise VideoEncodeError(f"ffmpeg failed for {self.path}: {self.failed}")
+    self._close_err()
     self._part.replace(self.path)
-    if self._err is not None:
-      self._err.close()
     return self.path if self.frames else None
 
   def abort(self) -> None:
@@ -207,8 +223,9 @@ class StreamingVideoRecorder:
   trigger only) that streams frames to disk.
 
   ``path_fn(step)`` returns the MP4 path of a clip started at env step
-  ``step``. Encoder failures are logged and disable recording for that clip;
-  they never propagate into the training loop.
+  ``step``. Any failure while opening, rendering or encoding a clip is logged
+  and disables recording for that clip; it never propagates into the training
+  loop. Exceptions from the wrapped ``env.step`` itself are *not* swallowed.
   """
 
   def __init__(
@@ -246,9 +263,22 @@ class StreamingVideoRecorder:
   def render(self) -> Any:
     return self._wrapped_env.render()
 
+  def _clip_failed(self, e: BaseException) -> None:
+    self.errors.append(str(e))
+    print(f"[ERROR] training video disabled for this clip: {type(e).__name__}: {e}")
+    if self._writer is not None:
+      try:
+        self._writer.abort()
+      except Exception:
+        pass
+    self._writer = None
+
   def step(self, action: Any) -> Any:
     if self._writer is None and self._trigger(self.step_count):
-      self._writer = StreamingVideoWriter(self._path_fn(self.step_count), self._fps)
+      try:
+        self._writer = StreamingVideoWriter(self._path_fn(self.step_count), self._fps)
+      except Exception as e:  # noqa: BLE001 - e.g. unwritable video dir
+        self._clip_failed(e)
     out = self._wrapped_env.step(action)
     if self._writer is not None:
       try:
@@ -259,11 +289,8 @@ class StreamingVideoRecorder:
           self._writer.add(frame)
         if self._writer.frames >= self._length:
           self._finish()
-      except VideoEncodeError as e:
-        self.errors.append(str(e))
-        print(f"[ERROR] training video disabled for this clip: {e}")
-        self._writer.abort()
-        self._writer = None
+      except Exception as e:  # noqa: BLE001 - render/EGL/encoder: never kill training
+        self._clip_failed(e)
     self.step_count += 1
     return out
 
@@ -276,10 +303,12 @@ class StreamingVideoRecorder:
       if p is not None:
         self.saved.append(p)
         print(f"[INFO] saved video {p}")
-    except VideoEncodeError as e:
+    except Exception as e:  # noqa: BLE001
       self.errors.append(str(e))
       print(f"[ERROR] {e}")
 
   def close(self) -> None:
-    self._finish()
-    self._wrapped_env.close()
+    try:
+      self._finish()
+    finally:
+      self._wrapped_env.close()

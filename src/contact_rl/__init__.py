@@ -50,4 +50,6 @@ def require_tasks() -> None:
     ) from TASKS_IMPORT_ERROR
 
 
-__all__ = ["tasks", "require_tasks", "TASKS_IMPORT_ERROR"]
+# ``tasks`` is only exported when it actually imported (``from contact_rl
+# import *`` must not fail on a machine without the simulator stack).
+__all__ = ["require_tasks", "TASKS_IMPORT_ERROR"] + (["tasks"] if TASKS_IMPORT_ERROR is None else [])

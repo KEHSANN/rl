@@ -15,11 +15,19 @@ start_tmux() {  # start_tmux <session> <command...>
   fi
   # The command's exit code is captured *immediately* (a later `echo` would
   # otherwise reset $? to 0 and always report success). 'exec bash' keeps the
-  # window open after the command ends so errors stay visible.
-  tmux new-session -d -s "$s" -c "$REPO" "$(tmux_wrap "$@")"
+  # window open after the command ends so errors stay visible. The snippet is
+  # run by bash explicitly: the user's tmux default-shell (sh, zsh, fish) may
+  # not understand bash's %q quoting.
+  tmux new-session -d -s "$s" -c "$REPO" "bash -c $(printf '%q' "$(tmux_wrap "$@")")"
   echo "started tmux session '$s'  ->  tmux attach -t $s   (detach: Ctrl-b d)"
 }
-tmux_wrap() {  # shell snippet: run <command...>, report its real exit code, keep a shell
+tmux_wrap() {  # shell snippet: export GPU/GL env, run <command...>, report its real exit code, keep a shell
+  # A tmux server that is already running keeps its *own* (stale) environment,
+  # so the variables that select the GPU / GL backend are passed explicitly.
+  local v
+  for v in CUDA_VISIBLE_DEVICES MUJOCO_GL PYOPENGL_PLATFORM MUJOCO_EGL_DEVICE_ID; do
+    if [ -n "${!v+x}" ]; then printf 'export %s=%q; ' "$v" "${!v}"; fi
+  done
   printf '%q ' "$@"
   printf '%s' '; rc=$?; echo; echo "[exited with $rc]"; exec bash'
 }

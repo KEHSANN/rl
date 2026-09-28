@@ -73,6 +73,7 @@ def configure_headless_rendering() -> str:
   before = os.environ.get("MUJOCO_GL")
   if before is not None and not before.strip():
     del os.environ["MUJOCO_GL"]  # MUJOCO_GL="" is not a valid MuJoCo backend
+    before = None  # "" and unset mean the same thing to MuJoCo
   if not os.environ.get("MUJOCO_GL") and not has_display():
     os.environ["MUJOCO_GL"] = "egl"
   backend = os.environ.get("MUJOCO_GL", "").lower()
@@ -382,14 +383,26 @@ def now_iso() -> str:
 
 
 def write_json(path: Path, data: Any) -> None:
+  """Atomically replace ``path`` with ``data`` as JSON.
+
+  The temporary file name is unique per process, so two processes writing the
+  same file (e.g. a user re-running an evaluation while the watcher writes the
+  same ``summary.json``) can never interleave into one temp file; the last
+  ``os.replace`` wins and readers only ever see a complete document. The temp
+  file is removed if serialisation fails.
+  """
   path = Path(path)
   path.parent.mkdir(parents=True, exist_ok=True)
-  tmp = path.with_suffix(path.suffix + ".tmp")
-  with open(tmp, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2, default=str)
-    f.flush()
-    os.fsync(f.fileno())
-  os.replace(tmp, path)
+  tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+  try:
+    with open(tmp, "w", encoding="utf-8") as f:
+      json.dump(data, f, indent=2, default=str)
+      f.flush()
+      os.fsync(f.fileno())
+    os.replace(tmp, path)
+  finally:
+    if tmp.exists():
+      tmp.unlink(missing_ok=True)
 
 
 def read_json(path: Path, default: Any = None) -> Any:

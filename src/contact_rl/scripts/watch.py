@@ -30,7 +30,9 @@ Loop::
   evaluation; ``--source-checkpoint`` makes ``summary.json`` /
   ``evaluations.csv`` record the original ``checkpoints/model_<it>.pt``, not
   the deleted snapshot. A checkpoint deleted before its turn is recorded as
-  skipped.
+  skipped. Snapshots left behind by a watcher that was SIGKILLed mid-evaluation
+  are removed when the next watcher starts (it holds the run lock, so no other
+  watcher can be using them).
 * A stale ``summary.json`` from an earlier (crashed) attempt is removed
   before each attempt, and a summary is only accepted if the evaluation
   exited 0 and reports the expected iteration.
@@ -211,6 +213,23 @@ class Watcher:
       ck.copy_atomic(path, snap)
     return snap
 
+  def cleanup_stale_snapshots(self) -> list[Path]:
+    """Remove ``metrics/iteration_*/.snapshot`` dirs left by a watcher that
+    was killed (SIGKILL / OOM killer / power loss) mid-evaluation. Only called
+    while holding the run's watch lock, i.e. no other watcher can be
+    evaluating from them. Returns the removed dirs."""
+    removed: list[Path] = []
+    metrics = self.run_dir / "metrics"
+    if not metrics.is_dir():
+      return removed
+    for snap_dir in sorted(metrics.glob("iteration_*/.snapshot")):
+      if snap_dir.is_dir():
+        shutil.rmtree(snap_dir, ignore_errors=True)
+        removed.append(snap_dir)
+    if removed:
+      print(f"[watch] removed {len(removed)} stale evaluation snapshot(s) from a previous watcher", flush=True)
+    return removed
+
   def evaluate(self, it: int, path: Path) -> bool:
     key = str(it)
     tag = iteration_tag(it)
@@ -292,6 +311,10 @@ class Watcher:
   def run(self) -> None:
     print(f"[watch] watching {self.run_dir} every {self.cfg.interval_s:.0f}s "
           f"({len(self.state['evaluated'])} already evaluated)", flush=True)
+    try:
+      self.cleanup_stale_snapshots()
+    except Exception as e:  # noqa: BLE001
+      print(f"[watch] stale snapshot cleanup failed (continuing): {e}", flush=True)
     while not self.stop:
       try:
         self.poll_once()

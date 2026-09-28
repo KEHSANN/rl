@@ -27,20 +27,30 @@ Examples::
 GPUs: ``--gpu-ids 0`` (default) / ``--gpu-ids 1`` / ``--gpu-ids all`` with one
 visible GPU all train in this process with full run management. Only when
 more than one GPU is actually selected (``--gpu-ids 0 1``, or ``all`` with
-several visible GPUs) is training delegated unchanged to mjlab's torchrunx
-launcher (legacy logs/rsl_rl layout, no run management).
+several visible GPUs) is training delegated to mjlab's torchrunx launcher
+with a plain mjlab ``TrainConfig`` (legacy logs/rsl_rl layout, no run
+management; the contact-train-only flags are ignored with a warning).
+
+run_info.json: written as soon as the run dir exists (``status="starting"``),
+updated to ``"running"`` once training starts, and always finalised with
+``status`` (finished | stopped | aborted | failed), ``exit_code``, ``error``
+(``null`` on success), ``finished`` and ``last_checkpoint_iteration``. A failed
+run can never be recorded as a success; the traceback also goes to
+``logs/error.txt``.
 
 Exit codes: 0 = finished or stopped cleanly (SIGINT/SIGTERM), 130 = hard abort
-(second Ctrl-C), 1 = any other error (the traceback is re-raised). The code is
-recorded as ``exit_code`` in ``run_info.json`` in every case, and the env is
-closed even if the runner, the resume load or training itself fails.
+(second Ctrl-C), 1 = any other error (the traceback is re-raised). The env is
+closed even if env construction, the runner, the resume load or training
+itself fails.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sys
+import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -48,6 +58,9 @@ from typing import Any, Callable
 from contact_rl.utils.runtime import configure_headless_rendering
 
 configure_headless_rendering()  # before anything can import mujoco
+
+# Flags that only contact-train understands (ignored by mjlab's launcher).
+CONTACT_ONLY_FLAGS = ("resume_from", "device", "run_root", "keep_last", "keep_every", "keep_best", "export_onnx")
 
 
 def _config_cls():
@@ -121,6 +134,31 @@ def close_quietly(env: Any) -> None:
     print(f"[WARN] env close failed: {e}")
 
 
+def run_status(code: int, stop_reason: str | None = None) -> str:
+  """Final ``run_info.json`` status for an exit code: never "finished" unless
+  training really completed (code 0 without a stop request)."""
+  if code == 0:
+    return "stopped" if stop_reason else "finished"
+  if code == 130:
+    return "aborted"
+  return "failed"
+
+
+def base_config(cfg: Any, base_cls: type) -> Any:
+  """Copy the ``base_cls`` fields of ``cfg`` into a plain ``base_cls``
+  instance. Used for multi-GPU delegation: torchrunx pickles the config for
+  its workers, and the function-local ``ContactTrainConfig`` class cannot be
+  pickled, while mjlab's module-level ``TrainConfig`` can."""
+  kwargs = {f.name: getattr(cfg, f.name) for f in dataclasses.fields(base_cls) if f.init}
+  return base_cls(**kwargs)
+
+
+def ignored_contact_flags(cfg: Any, defaults: Any) -> list[str]:
+  """contact-train-only flags whose value differs from the default (these are
+  ignored when training is delegated to mjlab's multi-GPU launcher)."""
+  return [n for n in CONTACT_ONLY_FLAGS if getattr(cfg, n, None) != getattr(defaults, n, None)]
+
+
 def _pick_device(cfg) -> str:
   from contact_rl.utils.runtime import resolve_device
 
@@ -186,17 +224,22 @@ def run_contact_train(task_id: str, cfg) -> int:
 
   run_dir = ck.create_run_dir(cfg.run_root, cfg.agent.experiment_name, cfg.agent.run_name or None)
   rt.install_console_tee(run_dir / "logs" / "train.log")
+  rt.update_run_info(run_dir, status="starting", task=task_id, started=rt.now_iso(), pid=os.getpid(), argv=sys.argv)
 
-  cfg.env.seed = cfg.agent.seed
-  nan_guard = apply_nan_guard(cfg)  # must happen before the env (and its sim) is built
-  env = ManagerBasedRlEnv(cfg=cfg.env, device=device, render_mode="rgb_array" if cfg.video else None)
-  # Everything from here on runs under try/finally: a failing runner
-  # construction, resume load, CUDA OOM or NaN still closes the env (EGL
-  # context, ffmpeg) and records the real exit code in run_info.json.
-  closable: Any = env
+  # Everything from here on runs under try/finally: a failing env
+  # construction, runner construction, resume load, CUDA OOM or NaN still
+  # closes whatever was built (EGL context, ffmpeg) and records the real
+  # status / exit code / error in run_info.json.
+  closable: Any = None
   runner = None
   code = 1
+  error: str | None = None
+  stop_reason: str | None = None
   try:
+    cfg.env.seed = cfg.agent.seed
+    nan_guard = apply_nan_guard(cfg)  # must happen before the env (and its sim) is built
+    env = ManagerBasedRlEnv(cfg=cfg.env, device=device, render_mode="rgb_array" if cfg.video else None)
+    closable = env
     nspe = int(cfg.agent.num_steps_per_env)
     if cfg.video:
       env = StreamingVideoRecorder(
@@ -243,6 +286,7 @@ def run_contact_train(task_id: str, cfg) -> int:
     gpu = rt.hardware_info()
     info = rt.update_run_info(
       run_dir,
+      status="running",
       task=task_id,
       experiment=cfg.agent.experiment_name,
       device=device,
@@ -257,7 +301,6 @@ def run_contact_train(task_id: str, cfg) -> int:
       hardware=gpu,
       mujoco_gl=os.environ.get("MUJOCO_GL"),
       resume=resume_meta,
-      started=rt.now_iso(),
       retention={"keep_last": cfg.keep_last, "keep_every": cfg.keep_every, "keep_best": cfg.keep_best},
     )
     start = int(runner.current_learning_iteration)
@@ -285,14 +328,37 @@ def run_contact_train(task_id: str, cfg) -> int:
       runner.learn(num_learning_iterations=cfg.agent.max_iterations, init_at_random_ep_len=True)
       print("[contact-train] finished.")
     except TrainingStopped as e:
+      stop_reason = str(e) or "stop requested"
       print(f"[contact-train] stopped cleanly on {e}; last checkpoint iteration {runner._last_saved_it}.")
     code = 0
   except KeyboardInterrupt:
     print("[contact-train] aborted (second Ctrl-C). The last complete checkpoint is intact.")
     code = 130
+    error = "KeyboardInterrupt (hard abort)"
+  except BaseException as e:
+    # Record the failure, then re-raise so the traceback is shown and the
+    # process exits non-zero (SystemExit keeps its own code).
+    code = e.code if isinstance(e, SystemExit) and isinstance(e.code, int) and e.code != 0 else 1
+    error = f"{type(e).__name__}: {e}"
+    try:
+      (run_dir / "logs").mkdir(parents=True, exist_ok=True)
+      (run_dir / "logs" / "error.txt").write_text(traceback.format_exc())
+    except Exception:
+      pass
+    raise
   finally:
     try:
-      rt.update_run_info(run_dir, finished=rt.now_iso(), exit_code=code)
+      rt.update_run_info(
+        run_dir,
+        finished=rt.now_iso(),
+        exit_code=code,
+        status=run_status(code, stop_reason),
+        error=error,
+        stop_reason=stop_reason,
+        last_checkpoint_iteration=getattr(runner, "_last_saved_it", None),
+      )
+    except Exception as e:  # noqa: BLE001 - never mask the real error
+      print(f"[WARN] could not finalise run_info.json: {e}")
     finally:
       close_quietly(closable)
   return code
@@ -321,10 +387,14 @@ def parse_args(argv: list[str] | None = None):
 def main() -> None:
   task, args = parse_args()
   if is_multi_gpu(args.gpu_ids):
-    from mjlab.scripts.train import launch_training
+    from mjlab.scripts.train import TrainConfig, launch_training
 
+    defaults = type(args)(env=args.env, agent=args.agent)
+    ignored = ignored_contact_flags(args, defaults)
     print("[WARN] multi-GPU: delegating to mjlab's launcher (logs/rsl_rl layout, no contact-train run management).")
-    launch_training(task_id=task, args=args)
+    if ignored:
+      print(f"[WARN] multi-GPU: ignoring contact-train-only flags: {', '.join('--' + n.replace('_', '-') for n in ignored)}")
+    launch_training(task_id=task, args=base_config(args, TrainConfig))
     return
   sys.exit(run_contact_train(task, args))
 
