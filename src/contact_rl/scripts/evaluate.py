@@ -5,7 +5,8 @@ Modes
 ``--mode fig6`` (default, backwards compatible): the paper's Fig. 6 protocol.
 For every gait and command duration ``S`` the policy is rolled out on
 ``num_envs`` parallel episodes of ``episode_s`` seconds (paper: 1000 x 15 s,
-S in [0.2, 0.9] s) and the legacy table ``--out-csv`` is written as before.
+S in [0.2, 0.9] s) and the legacy table ``--out-csv`` is written as before
+(pooled, step-weighted contact error / Hamming per (gait, S)).
 
 ``--mode episodes``: one rollout with the training command distribution (used
 by ``contact-watch``).
@@ -13,18 +14,15 @@ by ``contact-watch``).
 Both modes write, to ``--out-dir`` (default ``<run>/metrics/iteration_<it>``)::
 
   metrics.csv    one row per episode (first episode of every env)
-  summary.json   rates + mean/std per metric, overall and per (gait, S)
+  summary.json   rates + per-episode mean/std (and pooled values) per metric,
+                 overall and per (gait, S)
 
-Per-episode fields: reward, length, termination (fall | timeout |
-other_termination | running), fell, success, contact_plan_hamming,
-contact_location_error_cm, foot_tracking_error_cm, lin_vel_error_mps
-(base xy velocity vs. the planner's reference velocity), yaw_rate_error_rps,
-goals_discovered. The terminal (auto-reset) transition is excluded from state
-metrics and time-outs are never counted as falls (see
-:mod:`contact_rl.utils.episode_metrics`).
+and append one row to ``<run>/metrics/evaluations.csv``.
 
-Videos (``--video True``): env 0 of the first rollout, streamed to
-``--video-dir`` (default ``<run>/videos/iteration_<it>``) with a text HUD.
+``--source-checkpoint``: the checkpoint the evaluated file is a copy of.
+``contact-watch`` evaluates a temporary hard-linked snapshot (deleted after
+the evaluation) and passes the original ``checkpoints/model_<it>.pt`` here so
+``summary.json`` and ``evaluations.csv`` never point at the deleted snapshot.
 
 Examples::
 
@@ -74,9 +72,10 @@ class EvalConfig:
   """Also write evaluation/* scalars to <run>/metrics/tb (used by contact-watch)."""
   run_dir: str | None = None
   """Run directory the results belong to. Default: derived from the checkpoint
-  path (``<run>/checkpoints/model_<it>.pt``). contact-watch evaluates a
-  hard-linked snapshot of the checkpoint (so retention cannot delete it
-  mid-evaluation) and passes the real run directory here."""
+  path (``<run>/checkpoints/model_<it>.pt``)."""
+  source_checkpoint: str | None = None
+  """Original checkpoint recorded in summary.json / evaluations.csv when the
+  evaluated file is a temporary snapshot (set by contact-watch)."""
 
 
 def _checkpoint(cfg: EvalConfig) -> Path:
@@ -86,6 +85,12 @@ def _checkpoint(cfg: EvalConfig) -> Path:
   if not spec:
     raise SystemExit("Pass --checkpoint <selector> or --checkpoint-file <model.pt>.")
   return resolve_checkpoint(spec, cfg.run_root)
+
+
+def recorded_checkpoint(cfg: EvalConfig, ckpt: Path) -> Path:
+  """The checkpoint path shown to the user: ``--source-checkpoint`` if given,
+  else the evaluated file."""
+  return Path(cfg.source_checkpoint) if cfg.source_checkpoint else Path(ckpt)
 
 
 def rollout(cfg: EvalConfig, ckpt: Path, device: str, gait: str | None, duration: float | None,
@@ -101,7 +106,7 @@ def rollout(cfg: EvalConfig, ckpt: Path, device: str, gait: str | None, duration
   from contact_rl.tasks.contact.mdp.planning import unit
   from contact_rl.utils.episode_metrics import EpisodeAccumulator, classify
   from contact_rl.utils.policy_state import reset_recurrent_state
-  from contact_rl.utils.video import Hud, StreamingVideoWriter, VideoEncodeError
+  from contact_rl.utils.video import Hud, StreamingVideoWriter
 
   env_cfg = load_env_cfg(cfg.task, play=True)
   agent_cfg = load_rl_cfg(cfg.task)
@@ -119,83 +124,89 @@ def rollout(cfg: EvalConfig, ckpt: Path, device: str, gait: str | None, duration
   cmd.debug_vis = video_path is not None
 
   env = ManagerBasedRlEnv(cfg=env_cfg, device=device, render_mode="rgb_array" if video_path else None)
-  venv = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
-  runner_cls = load_runner_cls(cfg.task) or MjlabOnPolicyRunner
-  runner = runner_cls(venv, asdict(agent_cfg), device=device)
-  runner.load(str(ckpt), load_cfg={"actor": True}, strict=True, map_location=device)
-  policy = runner.get_inference_policy(device=device)
-  reset_recurrent_state(policy)
+  writer = None
+  try:
+    venv = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    runner_cls = load_runner_cls(cfg.task) or MjlabOnPolicyRunner
+    runner = runner_cls(venv, asdict(agent_cfg), device=device)
+    runner.load(str(ckpt), load_cfg={"actor": True}, strict=True, map_location=device)
+    policy = runner.get_inference_policy(device=device)
+    reset_recurrent_state(policy)
 
-  term = env.command_manager.get_term("contact")
-  assert isinstance(term, ContactGoalCommand)
-  robot = term.robot
-  pl = term.planner
-  tm = env.termination_manager
-  n = env.num_envs
-  zeros_b = torch.zeros(n, dtype=torch.bool, device=device)
-  acc = EpisodeAccumulator(torch.zeros(n, device=device))
-  writer = StreamingVideoWriter(video_path, fps=1.0 / env.step_dt) if video_path else None
-  hud = Hud(cfg.hud)
-  video_err = None
+    term = env.command_manager.get_term("contact")
+    assert isinstance(term, ContactGoalCommand)
+    robot = term.robot
+    pl = term.planner
+    tm = env.termination_manager
+    n = env.num_envs
+    zeros_b = torch.zeros(n, dtype=torch.bool, device=device)
+    acc = EpisodeAccumulator(torch.zeros(n, device=device))
+    writer = StreamingVideoWriter(video_path, fps=1.0 / env.step_dt) if video_path else None
+    hud = Hud(cfg.hud)
+    video_err = None
 
-  obs = venv.get_observations()
-  max_steps = int(env.max_episode_length) + 1
-  t0 = time.time()
-  with torch.inference_mode():
-    for k in range(max_steps):
-      i_con = term.current_contact_goal.clone()
-      goal = term.goal_pos_w[:, :, 0, :].clone()
-      speed = pl.stride.mean(dim=1) / (pl.period(torch.arange(n, device=device)) * pl.switch_dt)
-      v_cmd = speed.unsqueeze(-1) * unit(pl.ref_yaw + pl.heading_off)
-      w_cmd = pl.yaw_rate.clone()
+    obs = venv.get_observations()
+    max_steps = int(env.max_episode_length) + 1
+    t0 = time.time()
+    with torch.inference_mode():
+      for k in range(max_steps):
+        i_con = term.current_contact_goal.clone()
+        goal = term.goal_pos_w[:, :, 0, :].clone()
+        speed = pl.stride.mean(dim=1) / (pl.period(torch.arange(n, device=device)) * pl.switch_dt)
+        v_cmd = speed.unsqueeze(-1) * unit(pl.ref_yaw + pl.heading_off)
+        w_cmd = pl.yaw_rate.clone()
 
-      obs, rew, dones, _ = venv.step(policy(obs))
-      fell = tm.get_term("fell_over") if "fell_over" in tm.active_terms else zeros_b
-      reason = classify(tm.time_outs, tm.terminated, fell)
+        obs, rew, dones, _ = venv.step(policy(obs))
+        fell = tm.get_term("fell_over") if "fell_over" in tm.active_terms else zeros_b
+        reason = classify(tm.time_outs, tm.terminated, fell)
 
-      i_act = term.actual_contact()
-      dist = torch.norm(term.foot_pos_w() - goal, dim=-1)
-      in_c = ((i_con > 0.5) & (i_act > 0.5)).float()
-      acc.step(
-        rew,
-        reason,
-        hamming=(i_con - i_act).abs().sum(dim=1),
-        loc_err_sum=(dist * in_c).sum(dim=1),
-        loc_cnt=in_c.sum(dim=1),
-        tracking=dist.mean(dim=1),
-        lin_vel_err=torch.norm(robot.data.root_link_lin_vel_w[:, :2] - v_cmd, dim=-1),
-        yaw_rate_err=(robot.data.root_link_ang_vel_w[:, 2] - w_cmd).abs(),
-        discovered=term.just_discovered.float(),
-      )
-      reset_recurrent_state(policy, dones)  # no GRU state leaks into the next episode
+        i_act = term.actual_contact()
+        dist = torch.norm(term.foot_pos_w() - goal, dim=-1)
+        in_c = ((i_con > 0.5) & (i_act > 0.5)).float()
+        acc.step(
+          rew,
+          reason,
+          hamming=(i_con - i_act).abs().sum(dim=1),
+          loc_err_sum=(dist * in_c).sum(dim=1),
+          loc_cnt=in_c.sum(dim=1),
+          tracking=dist.mean(dim=1),
+          lin_vel_err=torch.norm(robot.data.root_link_lin_vel_w[:, :2] - v_cmd, dim=-1),
+          yaw_rate_err=(robot.data.root_link_ang_vel_w[:, 2] - w_cmd).abs(),
+          discovered=term.just_discovered.float(),
+        )
+        reset_recurrent_state(policy, dones)  # no GRU state leaks into the next episode
 
-      if writer is not None and k < cfg.video_steps:
-        try:
-          frame = env.render()
-          if frame is not None:
-            d = describe_command(pl, 0)
-            lines = [
-              label or f"{ckpt.parent.parent.name}/{ckpt.name}",
-              f"gait {d['gait']}  v_cmd {d['speed_mps']:.2f} m/s  hdg {d['heading_offset_deg']:.0f} deg",
-              f"yaw_rate {d['yaw_rate_rps']:.2f} rad/s  t={k * env.step_dt:5.2f}s",
-            ]
-            if bool(dones[0]):
-              lines.append("EPISODE END: " + ["", "timeout", "FALL", "terminated"][int(reason[0])])
-            writer.add(hud.draw(frame, lines))
-        except VideoEncodeError as e:
-          video_err = str(e)
-          print(f"[ERROR] video disabled: {e}")
-          writer.abort()
-          writer = None
-      if acc.all_done() and (writer is None or k >= cfg.video_steps):
-        break
-  if writer is not None:
-    try:
-      writer.close()
-    except VideoEncodeError as e:
-      video_err = str(e)
-      print(f"[ERROR] {e}")
-  env.close()
+        if writer is not None and k < cfg.video_steps:
+          try:
+            frame = env.render()
+            if frame is not None:
+              d = describe_command(pl, 0)
+              lines = [
+                label or f"{ckpt.parent.parent.name}/{ckpt.name}",
+                f"gait {d['gait']}  v_cmd {d['speed_mps']:.2f} m/s  hdg {d['heading_offset_deg']:.0f} deg",
+                f"yaw_rate {d['yaw_rate_rps']:.2f} rad/s  t={k * env.step_dt:5.2f}s",
+              ]
+              if bool(dones[0]):
+                lines.append("EPISODE END: " + ["", "timeout", "FALL", "terminated"][int(reason[0])])
+              writer.add(hud.draw(frame, lines))
+          except Exception as e:  # noqa: BLE001  (encoder or EGL render failure: metrics still count)
+            video_err = f"{type(e).__name__}: {e}"
+            print(f"[ERROR] video disabled: {video_err}")
+            writer.abort()
+            writer = None
+        if acc.all_done() and (writer is None or k >= cfg.video_steps):
+          break
+    if writer is not None:
+      w, writer = writer, None
+      try:
+        w.close()
+      except Exception as e:  # noqa: BLE001
+        video_err = f"{type(e).__name__}: {e}"
+        print(f"[ERROR] {video_err}")
+  finally:
+    if writer is not None:  # exception mid-rollout: no ffmpeg / .part leftovers
+      writer.abort()
+    env.close()
   rows = acc.rows(env.step_dt, extra={
     "gait": gait or "all",
     "command_duration_s": duration if duration is not None else 0.5 * sum(env_cfg.commands["contact"].resampling_time_range),
@@ -206,7 +217,7 @@ def rollout(cfg: EvalConfig, ckpt: Path, device: str, gait: str | None, duration
 
 def _write_csv(path: Path, rows: list[dict]) -> None:
   if not rows:
-    raise RuntimeError(f"no rows to write to {path} (evaluation produced no episodes)")
+    raise SystemExit(f"[eval] no rows to write to {path} (evaluation produced no episodes)")
   path.parent.mkdir(parents=True, exist_ok=True)
   tmp = path.with_suffix(".csv.tmp")
   with open(tmp, "w", newline="") as f:
@@ -214,6 +225,46 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
     w.writeheader()
     w.writerows(rows)
   tmp.replace(path)
+
+
+def write_outputs(cfg: EvalConfig, ckpt: Path, run_dir: Path, out_dir: Path, video_dir: Path, it: int,
+                  device: str, rows: list[dict], groups: dict[str, dict]) -> dict:
+  """Write ``metrics.csv``, ``summary.json`` and the ``evaluations.csv`` row.
+  Raises SystemExit on an empty evaluation."""
+  from contact_rl.utils import runtime as rt
+  from contact_rl.utils.episode_metrics import summarize
+
+  if not rows:
+    raise SystemExit(f"[eval] evaluation of {ckpt} produced no episodes; nothing written to {out_dir}")
+  source = recorded_checkpoint(cfg, ckpt)
+  for r in rows:
+    r["iteration"] = it
+  _write_csv(out_dir / "metrics.csv", rows)
+  config = asdict(cfg)
+  config["checkpoint"] = str(source)
+  config["evaluated_file"] = str(ckpt)
+  summary = {
+    "checkpoint": str(source),
+    "iteration": it,
+    "task": cfg.task,
+    "mode": cfg.mode,
+    "device": device,
+    "time": rt.now_iso(),
+    "config": config,
+    "overall": summarize(rows),
+    "groups": groups,
+    "videos": sorted(str(p) for p in video_dir.glob("*.mp4")) if cfg.video else [],
+    "git": rt.git_info(),
+  }
+  rt.write_json(out_dir / "summary.json", summary)
+  o = summary["overall"]
+  print(f"[eval] fall={o['fall_rate']:.3f} timeout={o['timeout_rate']:.3f} success={o['success_rate']:.3f} "
+        f"reward={o['reward_mean']:.2f} loc_err={o['contact_location_error_cm_mean']:.2f}cm "
+        f"hamming={o['contact_plan_hamming_mean']:.3f} v_err={o['lin_vel_error_mps_mean']:.3f}")
+  if cfg.tensorboard:
+    _log_tensorboard(run_dir, it, o)
+  _append_history(run_dir, it, source, o)
+  return summary
 
 
 def evaluate(cfg: EvalConfig) -> dict:
@@ -224,8 +275,11 @@ def evaluate(cfg: EvalConfig) -> dict:
   ckpt = _checkpoint(cfg)
   device = rt.resolve_device(cfg.device)
   rt.set_egl_device_for(device)
-  run_dir = Path(cfg.run_dir) if cfg.run_dir else ck.run_dir_of_checkpoint(ckpt)
+  source = recorded_checkpoint(cfg, ckpt)
+  run_dir = Path(cfg.run_dir) if cfg.run_dir else ck.run_dir_of_checkpoint(source)
   it = ck.iteration_of(ckpt)
+  if it is None:
+    it = ck.iteration_of(source)
   if it is None:  # best.pt / latest.pt -> read the iteration from the file
     import torch
 
@@ -233,7 +287,8 @@ def evaluate(cfg: EvalConfig) -> dict:
   tag = f"iteration_{it:06d}"
   out_dir = Path(cfg.out_dir) if cfg.out_dir else run_dir / "metrics" / tag
   video_dir = Path(cfg.video_dir) if cfg.video_dir else run_dir / "videos" / tag
-  print(f"[eval] checkpoint {ckpt} (iteration {it}) on {device}; results -> {out_dir}")
+  shown = f"{source} (evaluating snapshot {ckpt})" if source != ckpt else str(ckpt)
+  print(f"[eval] checkpoint {shown} (iteration {it}) on {device}; results -> {out_dir}")
 
   rows: list[dict] = []
   groups: dict[str, dict] = {}
@@ -248,6 +303,9 @@ def evaluate(cfg: EvalConfig) -> dict:
         vp = video_dir / f"{gait}_S{s:.2f}.mp4" if (cfg.video and first) else None
         first = False
         r = rollout(cfg, ckpt, device, gait, s, vp, label=f"{run_dir.name} it {it}")
+        if not r:
+          print(f"[WARN] {gait} S={s:.2f}s produced no episodes; skipped")
+          continue
         rows += r
         sm = summarize(r)
         groups[f"{gait}/S={s:.2f}"] = sm
@@ -265,34 +323,12 @@ def evaluate(cfg: EvalConfig) -> dict:
         print(f"{gait:6s} S={s:.2f}s  loc_err={legacy[-1]['contact_location_error_cm']:.2f} cm  "
               f"hamming={legacy[-1]['contact_plan_hamming']:.3f}  fall={sm['fall_rate']:.3f}  "
               f"timeout={sm['timeout_rate']:.3f}")
+    if not legacy:
+      raise SystemExit("[eval] Fig. 6 evaluation produced no episodes (check --gaits / --durations).")
     _write_csv(Path(cfg.out_csv), legacy)
     print(f"[INFO] wrote {cfg.out_csv}")
 
-  for r in rows:
-    r["iteration"] = it
-  _write_csv(out_dir / "metrics.csv", rows)
-  summary = {
-    "checkpoint": str(ckpt),
-    "iteration": it,
-    "task": cfg.task,
-    "mode": cfg.mode,
-    "device": device,
-    "time": rt.now_iso(),
-    "config": asdict(cfg),
-    "overall": summarize(rows),
-    "groups": groups,
-    "videos": sorted(str(p) for p in video_dir.glob("*.mp4")) if cfg.video else [],
-    "git": rt.git_info(),
-  }
-  rt.write_json(out_dir / "summary.json", summary)
-  o = summary["overall"]
-  print(f"[eval] fall={o['fall_rate']:.3f} timeout={o['timeout_rate']:.3f} success={o['success_rate']:.3f} "
-        f"reward={o['reward_mean']:.2f} loc_err={o['contact_location_error_cm_mean']:.2f}cm "
-        f"hamming={o['contact_plan_hamming_mean']:.3f} v_err={o['lin_vel_error_mps_mean']:.3f}")
-  if cfg.tensorboard:
-    _log_tensorboard(run_dir, it, o)
-  _append_history(run_dir, it, ckpt, o)
-  return summary
+  return write_outputs(cfg, ckpt, run_dir, out_dir, video_dir, it, device, rows, groups)
 
 
 def _log_tensorboard(run_dir: Path, it: int, overall: dict) -> None:
@@ -310,11 +346,10 @@ def _log_tensorboard(run_dir: Path, it: int, overall: dict) -> None:
 
 
 def _append_history(run_dir: Path, it: int, ckpt: Path, overall: dict) -> None:
-  """metrics/evaluations.csv: one row per evaluated checkpoint (for comparing
-  checkpoints over time). An existing header is reused so rows stay aligned
-  even if the summary gains fields in a later version."""
+  """metrics/evaluations.csv: one row per evaluated checkpoint. An existing
+  header is reused so rows stay aligned."""
   path = run_dir / "metrics" / "evaluations.csv"
-  row = {"iteration": it, "checkpoint": ckpt.name, **{k: v for k, v in overall.items() if not isinstance(v, dict)}}
+  row = {"iteration": it, "checkpoint": Path(ckpt).name, **{k: v for k, v in overall.items() if not isinstance(v, dict)}}
   path.parent.mkdir(parents=True, exist_ok=True)
   fields = list(row.keys())
   new = not path.exists() or path.stat().st_size == 0
