@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # One-time setup on a fresh Linux x86_64 + NVIDIA VPS (no Docker needed).
-#   scripts/vps/setup.sh            # uv sync --extra cu128 --frozen, then contact-doctor
+# Re-run it after every `git pull` that changes uv.lock: the other scripts use
+# the environment as installed (UV_NO_SYNC=1, see common.sh).
+#   scripts/vps/setup.sh                 # uv sync --extra cu128 --frozen, then contact-doctor
+#   EXTRA=cpu scripts/vps/setup.sh       # CPU-only smoke-test box
+#   scripts/vps/setup.sh --skip-env      # extra args go to contact-doctor
 source "$(dirname "$0")/common.sh"
-uv sync --extra cu128 --python 3.12 --frozen
+uv sync --extra "${EXTRA:-cu128}" --python 3.12 --frozen
 uv run contact-doctor "$@"

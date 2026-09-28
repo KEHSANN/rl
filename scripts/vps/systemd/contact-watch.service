@@ -1,16 +1,20 @@
 # Optional systemd user unit for the watcher (see contact-train@.service).
 # Start it only after training has created its run dir: `--run latest` is
-# resolved once at startup. Exit code 3 = another watcher already holds the
-# run's lock; that is not a failure, so it is not restarted.
+# resolved once at startup (if there is no run yet it exits 1 and is retried
+# after RestartSec). Exit code 3 = another watcher already holds the run's
+# lock; that is not a failure, so it is not restarted. SIGTERM lets the
+# running evaluation finish; after TimeoutStopSec the whole cgroup (including
+# the evaluation child) is killed and the next watcher removes its snapshot.
 [Unit]
 Description=contact-rl checkpoint watcher
-After=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=%h/rl
 Environment=MUJOCO_GL=egl
 Environment=PYOPENGL_PLATFORM=egl
+Environment=PYTHONUNBUFFERED=1
+Environment=UV_NO_SYNC=1
 ExecStart=%h/.local/bin/uv run contact-watch --run latest --interval-s 120
 KillSignal=SIGTERM
 KillMode=mixed

@@ -6,5 +6,7 @@
 # Logs: runs/<experiment>/<run>/logs/train.log (persistent, also when detached).
 # Stop cleanly: scripts/vps/stop.sh train   (SIGINT -> checkpoint -> exit)
 source "$(dirname "$0")/common.sh"
-[ $# -ge 1 ] || { echo "usage: $0 <task> [contact-train args]" >&2; exit 2; }
+if [ $# -lt 1 ] || [ "${1#-}" != "$1" ]; then
+  echo "usage: $0 <task> [contact-train args]   (e.g. $0 Mjlab-Contact-Flat-Unitree-Go2)" >&2; exit 2
+fi
 start_tmux "${SESSION:-train}" uv run contact-train "$@"

@@ -5,6 +5,13 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-$MUJOCO_GL}"
+# Plain `uv run` re-syncs the project env first, and without `--extra cu128`
+# that sync targets the *no-extra* resolution: it would replace the CUDA torch
+# build that setup.sh installed (`uv sync --extra cu128`) with a different
+# torch wheel on every call. setup.sh syncs once, explicitly; every other
+# `uv run` uses the env exactly as installed (--no-sync, which implies
+# --frozen). Re-run setup.sh after a `git pull` that changes uv.lock.
+export UV_NO_SYNC="${UV_NO_SYNC:-1}"
 need() { command -v "$1" >/dev/null 2>&1 || { echo "error: '$1' not found ($2)" >&2; exit 1; }; }
 need uv "curl -LsSf https://astral.sh/uv/install.sh | sh"
 start_tmux() {  # start_tmux <session> <command...>
@@ -21,11 +28,13 @@ start_tmux() {  # start_tmux <session> <command...>
   tmux new-session -d -s "$s" -c "$REPO" "bash -c $(printf '%q' "$(tmux_wrap "$@")")"
   echo "started tmux session '$s'  ->  tmux attach -t $s   (detach: Ctrl-b d)"
 }
-tmux_wrap() {  # shell snippet: export GPU/GL env, run <command...>, report its real exit code, keep a shell
+# NOTE: keep tmux_wrap the last function in this file (tests source it alone).
+tmux_wrap() {  # shell snippet: export GPU/GL/uv env, run <command...>, report its real exit code, keep a shell
   # A tmux server that is already running keeps its *own* (stale) environment,
-  # so the variables that select the GPU / GL backend are passed explicitly.
+  # so the variables that select the GPU / GL backend / uv behaviour are
+  # passed explicitly.
   local v
-  for v in CUDA_VISIBLE_DEVICES MUJOCO_GL PYOPENGL_PLATFORM MUJOCO_EGL_DEVICE_ID; do
+  for v in CUDA_VISIBLE_DEVICES MUJOCO_GL PYOPENGL_PLATFORM MUJOCO_EGL_DEVICE_ID UV_NO_SYNC; do
     if [ -n "${!v+x}" ]; then printf 'export %s=%q; ' "$v" "${!v}"; fi
   done
   printf '%q ' "$@"

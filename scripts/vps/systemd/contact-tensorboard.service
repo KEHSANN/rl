@@ -1,12 +1,18 @@
-# Optional systemd user unit: TensorBoard on 127.0.0.1:6006 only.
+# Optional systemd user unit: TensorBoard on 127.0.0.1:6006 only (reach it
+# with scripts/vps/tunnel.sh). See contact-train@.service for installation.
 [Unit]
 Description=TensorBoard for contact-rl runs
 
 [Service]
 Type=simple
 WorkingDirectory=%h/rl
+Environment=PYTHONUNBUFFERED=1
+Environment=UV_NO_SYNC=1
 ExecStart=%h/.local/bin/uv run tensorboard --logdir runs --host 127.0.0.1 --port 6006
+KillSignal=SIGTERM
+TimeoutStopSec=30
 Restart=on-failure
+RestartSec=10
 
 [Install]
 WantedBy=default.target
