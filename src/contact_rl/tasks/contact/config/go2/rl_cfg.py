@@ -2,11 +2,16 @@
 
 The paper (Section 4, "Training") uses **PPO with a recurrent (GRU) policy and
 entropy decay** (8192 envs in IsaacLab). On the pinned stack
-(``rsl-rl-lib==5.0.1``) recurrence is rsl-rl's ``class_name="RNNModel"``;
-mjlab forwards the ``actor`` / ``critic`` dicts unchanged, so the
-:class:`RslRlRnnModelCfg` subclass below flows through and PPO switches to the
-recurrent mini-batch generator automatically. Entropy decay is applied by
-:class:`~.runner.ContactOnPolicyRunner`.
+(``rsl-rl-lib==5.0.1``) recurrence is rsl-rl's ``class_name="RNNModel"``
+(``rsl_rl/models/rnn_model.py``: ``rnn_type``, ``rnn_hidden_dim``,
+``rnn_num_layers``); mjlab forwards the ``actor`` / ``critic`` dicts unchanged,
+so the :class:`RslRlRnnModelCfg` subclass below flows through and PPO switches
+to the recurrent mini-batch generator automatically (``is_recurrent``).
+Entropy decay is applied by :class:`~.runner.ContactOnPolicyRunner`.
+
+Logging defaults to **TensorBoard** (mjlab's default is W&B, which blocks or
+fails on a headless VPS without ``wandb login``). Use ``--agent.logger wandb``
+to opt back in.
 """
 
 from __future__ import annotations
@@ -20,7 +25,9 @@ from mjlab.rl import (
 )
 
 # Entropy-decay schedule (read by ContactOnPolicyRunner). Linear START -> END
-# over DECAY_ITERS PPO iterations, constant afterwards.
+# over DECAY_ITERS PPO iterations, constant afterwards. The paper states that
+# entropy decay is used but not the schedule; these values are a documented
+# choice.
 ENTROPY_START = 0.01
 ENTROPY_END = 0.001
 ENTROPY_DECAY_ITERS = 5000
@@ -80,4 +87,7 @@ def unitree_go2_ppo_runner_cfg(improved: bool = False) -> RslRlOnPolicyRunnerCfg
     save_interval=50,
     num_steps_per_env=24,
     max_iterations=10_000,
+    logger="tensorboard",
+    wandb_project="contact-rl",
+    upload_model=False,
   )

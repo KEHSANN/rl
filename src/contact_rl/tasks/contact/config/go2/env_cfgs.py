@@ -16,6 +16,10 @@ from contact_rl.tasks.contact.contact_env_cfg import (
 # Foot collision geoms, ordered to match ``FOOT_ORDER`` (FL, FR, RL, RR).
 _FOOT_GEOMS = tuple(f"{name}_foot_collision" for name in FOOT_ORDER)
 
+# Paper, Section 4 "Training": 8192 parallel environments. Override with
+# ``--env.scene.num-envs`` on smaller GPUs (``contact-bench`` helps pick one).
+PAPER_NUM_ENVS = 8192
+
 
 def unitree_go2_flat_env_cfg(
   play: bool = False, improved: bool = False
@@ -30,6 +34,7 @@ def unitree_go2_flat_env_cfg(
   cfg = make_contact_env_cfg(actor_imu=improved)
 
   cfg.scene.entities = {"robot": get_go2_robot_cfg()}
+  cfg.scene.num_envs = PAPER_NUM_ENVS
 
   # Foot / ground contact sensor. ``ContactSensor`` resolves ``pattern`` in MJCF
   # declaration order; ``check_foot_ordering`` asserts it matches FOOT_ORDER.
@@ -53,10 +58,18 @@ def unitree_go2_flat_env_cfg(
 
   cfg.viewer.body_name = "base_link"
 
+  # Training never renders; the debug visualisation (planned footholds) is
+  # only needed by viewers and evaluation videos.
+  cfg.commands["contact"].debug_vis = play
+
   if play:
     cfg.episode_length_s = int(1e9)
     cfg.observations["actor"].enable_corruption = False
     cfg.events.pop("push_robot", None)
     cfg.scene.num_envs = 64
+    # Evaluation videos: a clean, larger frame focused on one robot.
+    cfg.viewer.max_extra_envs = 0
+    cfg.viewer.width = 640
+    cfg.viewer.height = 480
 
   return cfg
