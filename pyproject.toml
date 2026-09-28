@@ -34,9 +34,12 @@ cpu = ["torch>=2.7.0"]
 
 [project.scripts]
 # Thin wrappers that register the contact tasks before delegating to mjlab's
-# train / play CLIs (see src/contact_rl/scripts/).
+# train / play CLIs, plus the Fig. 6 evaluation and the hardware benchmark
+# (see src/contact_rl/scripts/).
 contact-train = "contact_rl.scripts.train:main"
 contact-play = "contact_rl.scripts.play:main"
+contact-eval = "contact_rl.scripts.evaluate:main"
+contact-bench = "contact_rl.scripts.benchmark:main"
 
 [build-system]
 requires = ["uv_build>=0.8.19,<0.9.0"]
@@ -124,3 +127,6 @@ indent-width = 2
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I", "B"]
 ignore = ["B011"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
