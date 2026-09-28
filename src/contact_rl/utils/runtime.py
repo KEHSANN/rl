@@ -1,0 +1,225 @@
+"""Process-level runtime helpers: headless GL, console tee, signals, run info.
+
+Nothing in this module imports torch / mujoco / mjlab at module level:
+:func:`configure_headless_rendering` has to run *before* ``import mujoco``
+because MuJoCo selects its OpenGL backend from ``MUJOCO_GL`` at import time.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import importlib.metadata as _md
+import io
+import json
+import os
+import platform
+import signal
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Callable
+
+TRACKED_DISTRIBUTIONS: tuple[str, ...] = (
+  "contact-rl",
+  "mjlab",
+  "torch",
+  "mujoco",
+  "mujoco-warp",
+  "warp-lang",
+  "rsl-rl-lib",
+  "numpy",
+  "tensordict",
+  "tensorboard",
+  "tyro",
+  "viser",
+  "mediapy",
+  "imageio-ffmpeg",
+  "pillow",
+  "onnx",
+  "onnxscript",
+  "PyOpenGL",
+  "GitPython",
+  "wandb",
+)
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def has_display() -> bool:
+  return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def configure_headless_rendering() -> str:
+  """Select a headless OpenGL backend unless the user already chose one.
+
+  No DISPLAY and no MUJOCO_GL -> egl. MUJOCO_GL=egl/osmesa implies the same
+  PYOPENGL_PLATFORM. Must be called before ``mujoco`` is imported.
+  """
+  if "MUJOCO_GL" not in os.environ and not has_display():
+    os.environ["MUJOCO_GL"] = "egl"
+  backend = os.environ.get("MUJOCO_GL", "").lower()
+  if backend in ("egl", "osmesa"):
+    os.environ.setdefault("PYOPENGL_PLATFORM", backend)
+  return backend or "default"
+
+
+def set_egl_device_for(device: str) -> None:
+  """Point MuJoCo's EGL context at the GPU used for simulation."""
+  if device.startswith("cuda") and "MUJOCO_EGL_DEVICE_ID" not in os.environ:
+    idx = device.split(":", 1)[1] if ":" in device else "0"
+    os.environ["MUJOCO_EGL_DEVICE_ID"] = idx
+
+
+def assert_private_bind(host: str, allow_public: bool) -> None:
+  """Refuse to bind an unauthenticated control server to a public interface."""
+  if host in _LOOPBACK_HOSTS or allow_public:
+    return
+  raise SystemExit(
+    f"Refusing to bind the interactive server to '{host}'. It has no "
+    "authentication; keep it on 127.0.0.1 and use an SSH tunnel "
+    "(ssh -L 8080:localhost:8080 user@vps)."
+  )
+
+
+class _Tee(io.TextIOBase):
+  """Write to a log file and (best effort) to the original stream; survives a
+  dropped SSH terminal."""
+
+  def __init__(self, stream: Any, file: Any):
+    self._stream = stream
+    self._file = file
+    self._stream_ok = True
+
+  def write(self, s: str) -> int:  # type: ignore[override]
+    self._file.write(s)
+    if self._stream_ok:
+      try:
+        self._stream.write(s)
+      except (OSError, ValueError):
+        self._stream_ok = False
+    return len(s)
+
+  def flush(self) -> None:  # type: ignore[override]
+    self._file.flush()
+    if self._stream_ok:
+      try:
+        self._stream.flush()
+      except (OSError, ValueError):
+        self._stream_ok = False
+
+  def isatty(self) -> bool:  # type: ignore[override]
+    return False
+
+  @property
+  def encoding(self) -> str:  # type: ignore[override]
+    return "utf-8"
+
+
+def install_console_tee(log_file: Path) -> None:
+  log_file.parent.mkdir(parents=True, exist_ok=True)
+  f = open(log_file, "a", buffering=1, encoding="utf-8")  # noqa: SIM115
+  sys.stdout = _Tee(sys.stdout, f)  # type: ignore[assignment]
+  sys.stderr = _Tee(sys.stderr, f)  # type: ignore[assignment]
+
+
+def install_stop_handlers(on_stop: Callable[[str], None]) -> None:
+  """SIGTERM / SIGINT request a graceful stop; SIGHUP is ignored."""
+
+  def _handler(signum, _frame):
+    on_stop(signal.Signals(signum).name)
+    if signum == signal.SIGINT:
+      signal.signal(signal.SIGINT, signal.default_int_handler)
+
+  signal.signal(signal.SIGTERM, _handler)
+  signal.signal(signal.SIGINT, _handler)
+  if hasattr(signal, "SIGHUP"):
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+
+def repo_root() -> Path:
+  return Path(__file__).resolve().parents[3]
+
+
+def git_info(path: Path | None = None) -> dict[str, Any]:
+  cwd = str(path or repo_root())
+
+  def _git(*args: str) -> str | None:
+    try:
+      out = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+      return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+  commit = _git("rev-parse", "HEAD")
+  if commit is None:
+    return {}
+  status = _git("status", "--porcelain")
+  return {"commit": commit, "branch": _git("rev-parse", "--abbrev-ref", "HEAD"), "dirty": bool(status)}
+
+
+def distribution_versions(names: tuple[str, ...] = TRACKED_DISTRIBUTIONS) -> dict:
+  out: dict[str, str | None] = {}
+  for n in names:
+    try:
+      out[n] = _md.version(n)
+    except _md.PackageNotFoundError:
+      out[n] = None
+  return out
+
+
+def hardware_info() -> dict[str, Any]:
+  info: dict[str, Any] = {
+    "python": platform.python_version(),
+    "platform": platform.platform(),
+    "cpu_count": os.cpu_count(),
+  }
+  try:
+    with open("/proc/meminfo") as f:
+      info["ram_gib"] = round(int(f.readline().split()[1]) / 1024**2, 1)
+  except (OSError, ValueError, IndexError):
+    pass
+  try:
+    import torch
+
+    info["torch_cuda"] = torch.version.cuda
+    if torch.cuda.is_available():
+      info["gpus"] = [
+        {
+          "index": i,
+          "name": torch.cuda.get_device_properties(i).name,
+          "vram_gib": round(torch.cuda.get_device_properties(i).total_memory / 1024**3, 1),
+          "capability": "%d.%d" % torch.cuda.get_device_capability(i),
+        }
+        for i in range(torch.cuda.device_count())
+      ]
+  except Exception as e:  # pragma: no cover
+    info["torch_error"] = repr(e)
+  return info
+
+
+def now_iso() -> str:
+  return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def write_json(path: Path, data: Any) -> None:
+  path.parent.mkdir(parents=True, exist_ok=True)
+  tmp = path.with_suffix(path.suffix + ".tmp")
+  with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2, default=str)
+  os.replace(tmp, path)
+
+
+def read_json(path: Path, default: Any = None) -> Any:
+  try:
+    with open(path, encoding="utf-8") as f:
+      return json.load(f)
+  except (OSError, ValueError):
+    return default
+
+
+def update_run_info(run_dir: Path, **fields: Any) -> dict:
+  path = run_dir / "run_info.json"
+  data = read_json(path, default={}) or {}
+  data.update(fields)
+  write_json(path, data)
+  return data
