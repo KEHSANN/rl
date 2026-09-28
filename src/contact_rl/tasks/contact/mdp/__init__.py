@@ -1,9 +1,7 @@
 """MDP terms for the contact-explicit task.
 
-Re-exports the generic mjlab MDP terms (actions, events, generic rewards /
-observations / terminations, domain randomisation ``dr``) and adds the
-contact-explicit command, rewards, observations, and a startup consistency
-check on the foot ordering.
+Re-exports the generic mjlab MDP terms and adds the contact-explicit command,
+planner, rewards, observations, and a startup foot-ordering check.
 """
 
 from mjlab.envs.mdp import *  # noqa: F401, F403
@@ -19,6 +17,12 @@ from .events import (  # noqa: F401
 from .observations import (  # noqa: F401
   feet_to_goal_distance,
   foot_contact_state,
+)
+from .planning import (  # noqa: F401
+  GAIT_PATTERNS,
+  GaitPlanner,
+  phase_masks,
+  proximity_kernel,
 )
 from .rewards import (  # noqa: F401
   base_angular_velocity_l2,
