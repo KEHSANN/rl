@@ -127,7 +127,8 @@ def is_valid_checkpoint(path: Path | str) -> bool:
   try:
     validate_checkpoint(path)
     return True
-  except CorruptCheckpointError:
+  except (CorruptCheckpointError, OSError):
+    # Retention may remove the file between is_file(), stat() and open().
     return False
 
 

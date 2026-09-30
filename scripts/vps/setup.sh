@@ -4,7 +4,8 @@
 # the environment as installed (UV_NO_SYNC=1, see common.sh).
 #   scripts/vps/setup.sh                 # uv sync --extra cu128 --frozen, then contact-doctor
 #   EXTRA=cpu scripts/vps/setup.sh       # CPU-only smoke-test box
-#   scripts/vps/setup.sh --skip-env      # extra args go to contact-doctor
+#   Extra arguments, if any, go to contact-doctor.
 source "$(dirname "$0")/common.sh"
 uv sync --extra "${EXTRA:-cu128}" --python 3.12 --frozen
+.venv/bin/python scripts/patches/patch_mujoco_warp_sensor.py
 uv run contact-doctor "$@"

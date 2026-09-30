@@ -29,9 +29,27 @@ import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from contact_rl.scripts import taskless_help
 from contact_rl.utils.runtime import configure_headless_rendering
 
 configure_headless_rendering()  # before mujoco is imported
+
+# Shown by ``contact-play --help`` (no task id yet, so the per-task option list
+# cannot be built).
+_USAGE = """\
+contact-play-only options (all mjlab play flags also work: --agent,
+--checkpoint-file, --wandb-run-path, --num-envs, --device, --video, --viewer,
+--no-terminations ...):
+  --checkpoint SPEC    checkpoint file | run dir | run_dir:<it>|best|latest | latest | best
+  --run-root DIR       default "runs"
+  --host HOST          viewer bind address                (default: 127.0.0.1)
+  --port PORT          viewer port                        (default: 8080)
+  --allow-public BOOL  required to bind a non-loopback host (no authentication!)
+
+examples:
+  contact-play Mjlab-Contact-Flat-Unitree-Go2 --checkpoint best
+  contact-play Mjlab-Contact-Flat-Unitree-Go2 --checkpoint runs/go2_contact/<run>:1500
+  ssh -N -L 8080:127.0.0.1:8080 <user>@<vps>    # then open http://localhost:8080"""
 
 
 def _config_cls():
@@ -216,8 +234,10 @@ def parse_args(argv: list[str] | None = None):
 
   cls = _config_cls()
   argv = sys.argv[1:] if argv is None else argv
+  tasks = list_tasks()
+  taskless_help(sys.argv[0], tasks, argv, usage=_USAGE)
   task, rest = tyro.cli(
-    tyro.extras.literal_type_from_choices(list_tasks()),
+    tyro.extras.literal_type_from_choices(tasks),
     args=argv, add_help=False, return_unknown_args=True, config=mjlab.TYRO_FLAGS,
   )
   args = tyro.cli(cls, args=rest, default=cls(), prog=sys.argv[0] + f" {task}", config=mjlab.TYRO_FLAGS)

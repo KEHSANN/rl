@@ -236,7 +236,6 @@ class Watcher:
     out_dir = self.run_dir / "metrics" / tag
     log_path = out_dir / "eval.log"
     summary_path = out_dir / "summary.json"
-    self.state["attempts"][key] = int(self.state["attempts"].get(key, 0)) + 1
     t0 = time.time()
     try:
       snap = self._snapshot(it, path)
@@ -247,8 +246,15 @@ class Watcher:
       rt.write_json(self.state_path, self.state)
       return False
     except OSError as e:
-      print(f"[watch] could not snapshot {path} ({e}); evaluating it in place", flush=True)
-      snap = path
+      shutil.rmtree(out_dir / ".snapshot", ignore_errors=True)
+      print(f"[watch] could not snapshot {path} ({e}); retrying on next poll", flush=True)
+      return False
+    # Validate the actual snapshot: the source may have changed since pending().
+    if not ck.is_valid_checkpoint(snap):
+      shutil.rmtree(snap.parent, ignore_errors=True)
+      print(f"[watch] iteration {it}: snapshot is no longer valid; retrying on next poll", flush=True)
+      return False
+    self.state["attempts"][key] = int(self.state["attempts"].get(key, 0)) + 1
     # A summary.json left by an earlier crashed / killed attempt must not be
     # mistaken for the result of this attempt.
     try:

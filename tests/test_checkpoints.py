@@ -132,3 +132,23 @@ def test_prune_dirs(tmp_path):
     (tmp_path / f"iteration_{it:06d}").mkdir()
   gone = ck.prune_dirs(tmp_path, keep=2)
   assert [g.name for g in gone] == ["iteration_000100"]
+
+
+def test_checkpoint_disappears_during_validation(tmp_path, monkeypatch):
+  import builtins
+  import zipfile
+
+  path = tmp_path / "model_1.pt"
+  with zipfile.ZipFile(path, "w") as archive:
+    archive.writestr("a/data.pkl", b"x")
+
+  original_open = builtins.open
+
+  def disappearing_open(file, *args, **kwargs):
+    if file == path:
+      path.unlink()
+      raise FileNotFoundError(path)
+    return original_open(file, *args, **kwargs)
+
+  monkeypatch.setattr(builtins, "open", disappearing_open)
+  assert ck.is_valid_checkpoint(path) is False

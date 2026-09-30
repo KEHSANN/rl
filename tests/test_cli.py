@@ -37,3 +37,31 @@ def test_train_and_play_cli_keep_mjlab_flags():
   assert args.resume_from.endswith(":100") and args.keep_last == 3 and args.video and args.keep_best
   task, pargs = play.parse_args(["Mjlab-Contact-Flat-Unitree-Go2", "--checkpoint", "best"])
   assert pargs.host == "127.0.0.1" and pargs.port == 8080 and not pargs.allow_public
+
+
+def test_taskless_help_lists_tasks_without_touching_a_given_task():
+  from contact_rl.scripts import taskless_help
+
+  tasks = ["Task-A", "Task-B"]
+  # No help flag, or a task id present: parsing must continue.
+  assert taskless_help("p/contact-train", tasks, ["Task-A"]) is None
+  assert taskless_help("p/contact-train", tasks, ["Task-A", "--help"]) is None
+  assert taskless_help("p/contact-train", tasks, ["--num-envs", "4"]) is None
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+@pytest.mark.parametrize("cmd", ["train", "play"])
+def test_help_without_a_task_prints_usage_and_exits_zero(cmd, flag, capsys):
+  """Regression: the task-id pass runs with ``add_help=False``, so ``--help``
+  alone used to die with ``Missing value for argument 'value'`` (exit 2)."""
+  pytest.importorskip("mjlab")
+  import importlib
+
+  mod = importlib.import_module(f"contact_rl.scripts.{cmd}")
+  with pytest.raises(SystemExit) as e:
+    mod.parse_args([flag])
+  assert e.value.code == 0
+  out = capsys.readouterr().out
+  assert "usage:" in out and "TASK" in out
+  assert "Mjlab-Contact-Flat-Unitree-Go2" in out
+  assert ("--checkpoint" in out) if cmd == "play" else ("--resume-from" in out)

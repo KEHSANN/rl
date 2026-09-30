@@ -136,3 +136,43 @@ def test_real_launcher_runs_child_in_own_session(tmp_path):
   w.cfg.timeout_s = 0.5
   assert w._launch([sys.executable, "-c", "import time; time.sleep(30)"], log) == -9
   assert "exceeded --timeout-s" in log.read_text()
+
+
+def test_snapshot_failure_never_evaluates_source_or_consumes_retry(tmp_path, monkeypatch):
+  run = ck.create_run_dir(tmp_path, "exp")
+  src = ckpt(run, 8)
+  la = Launcher()
+  w = Watcher(WatchConfig(settle_s=0.0, max_retries=0), run, launcher=la)
+
+  def fail_copy(source, dest):
+    raise PermissionError("snapshot unavailable")
+
+  monkeypatch.setattr("contact_rl.scripts.watch.os.link",
+                      lambda source, dest: (_ for _ in ()).throw(OSError("no hardlinks")))
+  monkeypatch.setattr(ck, "copy_atomic", fail_copy)
+  assert w.poll_once() == 1
+  assert la.calls == []
+  assert src.exists()
+  assert "8" not in w.state["attempts"]
+  assert "8" not in w.state["failed"]
+  assert not (run / "metrics" / "iteration_000008" / ".snapshot").exists()
+
+
+def test_invalid_snapshot_never_launches_or_consumes_retry(tmp_path, monkeypatch):
+  run = ck.create_run_dir(tmp_path, "exp")
+  ckpt(run, 9)
+  la = Launcher()
+  w = Watcher(WatchConfig(settle_s=0.0), run, launcher=la)
+  original = w._snapshot
+
+  def corrupt_snapshot(it, path):
+    snap = original(it, path)
+    snap.unlink()  # break the hard link; do not corrupt the source checkpoint
+    snap.write_bytes(b"invalid")
+    return snap
+
+  monkeypatch.setattr(w, "_snapshot", corrupt_snapshot)
+  assert w.poll_once() == 1
+  assert la.calls == []
+  assert "9" not in w.state["attempts"]
+  assert not (run / "metrics" / "iteration_000009" / ".snapshot").exists()

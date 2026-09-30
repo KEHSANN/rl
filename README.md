@@ -24,8 +24,8 @@ for the paper/code gap analysis.
 
 | Task id | What |
 | --- | --- |
-| `Mjlab-Contact-Flat-Unitree-Go2` | Paper-faithful implementation (default). |
-| `Mjlab-Contact-Flat-Unitree-Go2-Improved` | **Experimental**: + IMU in the actor and running observation normalisation. |
+| `Mjlab-Contact-Flat-Unitree-Go2` | Paper-faithful implementation (default). Runs under `runs/go2_contact/`. |
+| `Mjlab-Contact-Flat-Unitree-Go2-Improved` | **Experimental**: + IMU (base angular velocity, projected gravity) in the actor and running observation normalisation on actor *and* critic. Runs under `runs/go2_contact_improved/`. |
 
 ### The contact goal
 
@@ -58,9 +58,23 @@ is narrowed to Linux x86_64 (`[tool.uv] environments`).
 ```bash
 uv sync --extra cu128 --python 3.12 --frozen   # Linux x86_64 + NVIDIA GPU
 uv sync --extra cpu --frozen                   # CPU smoke tests only
+.venv/bin/python scripts/patches/patch_mujoco_warp_sensor.py   # required, see below
 export UV_NO_SYNC=1                            # see below
 uv run contact-doctor                          # machine-readiness report
 ```
+
+`scripts/vps/setup.sh` performs the sync, the patch and the doctor check for
+you (and `scripts/vps/common.sh` exports `UV_NO_SYNC=1`); run the commands
+above by hand only if you are not using it.
+
+**Post-sync patch (required):** `mujoco-warp==3.5.0.2` generates its sensor
+kernels from `mujoco_warp/_src/sensor.py`, whose `UNKNOWN` frame-axis branch
+reads `xmat` before it is assigned; Warp rejects the generated kernel and env
+construction fails. `scripts/patches/patch_mujoco_warp_sensor.py` inserts the
+missing `xmat` initialisation into the **installed** package. It is SHA256-gated
+(it refuses to touch an unexpected file), idempotent, atomic, and must be re-run
+after every `uv sync` that reinstalls `mujoco-warp`, because the edit lives in
+`.venv`, not in this repo.
 
 **`UV_NO_SYNC=1`:** `uv run` normally re-syncs the project env before every
 command, and without `--extra cu128` that sync targets the *no-extra*
@@ -76,6 +90,12 @@ Dependency-resolution notes (do not undo; details in `pyproject.toml`):
 `mujoco-warp==3.5.0.2` comes from PyPI rather than mjlab's git rev, and the
 `cu128` / `cpu` extras exist only on the workspace root.
 
+Two fixes carried in the vendored mjlab (`.mjlab_ref`):
+`scipy` is declared as a dependency because `mjlab.terrains` imports it while
+upstream never listed it, and `sim/sim.py` uses `wp.get_cuda_driver_version()`
+instead of `wp.context.runtime.driver_version`, which warp 1.16 no longer
+exposes (it raises `AttributeError`, disabling CUDA graphs).
+
 Headless rendering: importing `contact_rl` configures `MUJOCO_GL` (EGL on
 headless machines) *before* MuJoCo is imported; an explicitly exported
 `MUJOCO_GL` is always respected.
@@ -89,7 +109,11 @@ headless machines) *before* MuJoCo is imported; an explicitly exported
 | `contact-doctor` | `contact_rl.scripts.doctor` | environment diagnostics |
 | `contact-bench` | `contact_rl.scripts.benchmark` | hardware report + env-throughput sweep |
 
-Every command supports `--help`.
+Every command supports `--help`. `contact-train` and `contact-play` take the
+task id as a positional argument, so their help is two-level: `contact-train
+--help` lists the task ids plus the contact-train-only flags, while the full
+`--env.*` / `--agent.*` option list is built from the selected task and needs
+`contact-train <task> --help`.
 
 ## Training
 
@@ -139,9 +163,13 @@ Polls a run for new, settled, valid checkpoints and evaluates each once in an
 isolated `contact-eval` subprocess (own process group, `--timeout-s`). The
 evaluated file is a hard-linked snapshot, so retention cannot delete it
 mid-evaluation; `summary.json` / `evaluations.csv` record the original
-checkpoint path (`--source-checkpoint`). Stale `summary.json` files are removed
-before each attempt. `metrics/watch.lock` (flock) makes a second watcher on the
-same run exit with code 3; checkpoints deleted by retention are skipped.
+checkpoint path (`--source-checkpoint`). If the snapshot cannot be taken, or no
+longer validates once taken (retention replaced the source after it was
+queued), the checkpoint is retried on the next poll rather than evaluated in
+place, and the `--max-retries` budget is not consumed. Stale `summary.json`
+files are removed before each attempt. `metrics/watch.lock` (flock) makes a
+second watcher on the same run exit with code 3; checkpoints deleted by
+retention are skipped.
 Results: `metrics/iteration_<it>/`, `videos/iteration_<it>/`, `metrics/watch_state.json`.
 
 ## Play

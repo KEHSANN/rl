@@ -81,6 +81,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from contact_rl.scripts import taskless_help
 from contact_rl.utils import runtime as rt  # torch / mujoco free
 from contact_rl.utils.runtime import configure_headless_rendering
 
@@ -88,6 +89,23 @@ configure_headless_rendering()  # before anything can import mujoco
 
 # Flags that only contact-train understands (ignored by mjlab's launcher).
 CONTACT_ONLY_FLAGS = ("resume_from", "device", "run_root", "keep_last", "keep_every", "keep_best", "export_onnx")
+
+# Shown by ``contact-train --help`` (no task id yet, so the per-task option list
+# cannot be built); the contact-train-only flags are the part users look for.
+_USAGE = """\
+contact-train-only options (all mjlab --env.* / --agent.* flags also work):
+  --resume-from SPEC   checkpoint file | run dir | run_dir:<it>|best|latest | latest | best
+  --device DEV         cpu | cuda | cuda:<i>            (default: first of --gpu-ids)
+  --run-root DIR       default "runs"                   -> runs/<experiment>/<timestamp>
+  --keep-last N        keep newest N checkpoints (<=0: all)          (default: 5)
+  --keep-every N       also keep multiples of N                      (default: 1000)
+  --keep-best BOOL     maintain checkpoints/best.pt                  (default: True)
+  --export-onnx BOOL   write exported/policy.onnx at every save      (default: True)
+
+examples:
+  contact-train Mjlab-Contact-Flat-Unitree-Go2                      # paper default: 8192 envs
+  contact-train Mjlab-Contact-Flat-Unitree-Go2 --env.scene.num-envs 4096
+  contact-train Mjlab-Contact-Flat-Unitree-Go2 --resume-from runs/go2_contact/<run>:best"""
 
 
 def _config_cls():
@@ -546,8 +564,10 @@ def parse_args(argv: list[str] | None = None):
 
   cls = _config_cls()
   argv = sys.argv[1:] if argv is None else argv
+  tasks = list_tasks()
+  taskless_help(sys.argv[0], tasks, argv, usage=_USAGE)
   task, rest = tyro.cli(
-    tyro.extras.literal_type_from_choices(list_tasks()),
+    tyro.extras.literal_type_from_choices(tasks),
     args=argv, add_help=False, return_unknown_args=True, config=mjlab.TYRO_FLAGS,
   )
   default = cls(env=load_env_cfg(task), agent=load_rl_cfg(task))

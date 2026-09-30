@@ -34,3 +34,37 @@ On the VPS run every command with ``UV_NO_SYNC=1`` (exported by
 a plain ``uv run`` re-syncs the env without ``--extra cu128`` and replaces
 the CUDA torch build installed by ``scripts/vps/setup.sh``.
 """
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from pathlib import Path
+
+HELP_FLAGS = ("-h", "--help")
+
+
+def taskless_help(prog: str, tasks: Sequence[str], argv: Sequence[str], usage: str = "") -> None:
+  """Handle ``<cmd> --help`` for the two task-positional CLIs.
+
+  ``contact-train`` / ``contact-play`` parse the task id in a first
+  :func:`tyro.cli` pass configured with ``add_help=False`` (the help flag must
+  reach the *second* pass, which knows the task's options). Without a task id
+  that first pass therefore never sees ``--help``, it only sees a missing
+  required positional, and the command dies with ``Missing value for argument
+  'value'`` -- exit 2, no help. Print a usable top-level help instead; the full
+  option list stays behind ``<cmd> <task> --help`` because it is built from the
+  selected task's env / agent config.
+
+  Returns normally (so parsing continues) unless help without a task id was
+  requested, in which case it raises ``SystemExit(0)``.
+  """
+  if not any(a in HELP_FLAGS for a in argv) or any(a in tasks for a in argv):
+    return
+  name = Path(prog).name
+  lines = [f"usage: {name} TASK [OPTIONS]", "", "task ids:"]
+  lines += [f"  {t}" for t in tasks]
+  if usage:
+    lines += ["", usage.strip("\n")]
+  lines += ["", f"Options depend on the task; see:  {name} {tasks[0] if tasks else 'TASK'} --help"]
+  print("\n".join(lines))
+  raise SystemExit(0)
