@@ -278,3 +278,152 @@ UV_NO_SYNC=1 uv run --with pytest pytest tests -q   # after the env was synced o
 - **Linux/VPS-only**: anything importing mjlab / MuJoCo-Warp (the lock is
   Linux x86_64 only), EGL rendering, `contact-doctor` end to end.
 - **GPU-dependent**: training, `contact-bench`, full `contact-eval` runs.
+
+## Why many parallel environments (and why `contact-play` shows 64 robots)
+
+`contact-play` and `contact-eval` load the task's **play** config
+(`env_cfgs.py`, `play=True`), which uses **64** envs, no pushes, no observation
+noise and practically endless episodes. Nothing is being trained there: the
+robots only run the loaded checkpoint. Use `--num-envs 1` to see a single robot:
+
+```bash
+uv run contact-play Mjlab-Contact-Flat-Unitree-Go2 --checkpoint best --num-envs 1
+```
+
+Training (`contact-train`) uses **8192** envs by default. What the env count
+does and does not change:
+
+- **Iteration time barely changes, sample throughput does.** MuJoCo-Warp steps
+  all envs in one batched GPU kernel. Until the GPU is saturated, stepping 8192
+  envs takes about as long as stepping 512, so seconds per iteration look
+  "the same". But one PPO iteration collects `24 x num_envs` transitions
+  (512 envs: 12,288; 8192 envs: 196,608), i.e. 16x more experience in the same
+  wall-clock time. Compare the `fps` value printed per iteration (and
+  `training/fps` in TensorBoard), not the iteration time.
+- **Better gradients.** PPO splits each iteration into 4 mini-batches; with more
+  envs they are larger and less noisy, so learning per iteration is more stable.
+- **Command coverage (specific to this task).** Each env samples its gait,
+  front/hind stride, stance width, leg offsets and heading *or* yaw rate
+  **once**, when the env is built (paper Sec. 4). With 8192 envs every one of the
+  5 gaits gets ~1600 different command combinations; with 512 envs only ~100.
+  Fewer envs means the policy sees a thinner slice of the command space and
+  generalises worse, even when the iteration speed looks identical.
+- **Past the knee it stops helping.** Once the GPU is saturated, iteration time
+  grows roughly linearly with `num_envs` and throughput stops improving (or VRAM
+  runs out). Find the knee with
+  `uv run contact-bench --num-envs 1024 2048 4096 8192` and pick the largest size
+  whose `env-steps/s` still grows clearly.
+
+If you change `num_envs`, the number of iterations needed to converge changes
+too: with fewer envs you need more iterations for the same amount of experience.
+
+## How long training takes and when it ends
+
+- A run ends after `max_iterations` = **10,000** PPO iterations (`rl_cfg.py`),
+  i.e. iterations `start .. start + 9999` (printed at startup). At the end the log
+  prints `[contact-train] finished.` and `run_info.json` gets
+  `"status": "finished"`, `"exit_code": 0`.
+- Total time = `10,000 x (seconds per iteration)`. Every iteration prints a line
+  like `[iter 1234] reward=... t=1.80s fps=...`; multiply `t` by the remaining
+  iterations. Examples: 1 s/iter ~= 2.8 h, 2 s/iter ~= 5.6 h, 4 s/iter ~= 11 h.
+  The first iterations are slower (Warp kernel compilation / CUDA graph capture).
+  The same number is in TensorBoard as `training/iteration_time`.
+- Check progress at any time:
+
+```bash
+tail -f runs/go2_contact/<run>/logs/train.log      # per-iteration line
+cat runs/go2_contact/<run>/run_info.json           # status, last_iteration
+cat runs/go2_contact/<run>/checkpoints/index.json  # saved iterations + best
+```
+
+- A checkpoint is written every 50 iterations (`save_interval`), so you can stop
+  early at any time (Ctrl-C once, or `bash scripts/vps/stop.sh train`): the
+  current iteration finishes, a checkpoint is saved and `best.pt` stays usable.
+  The entropy coefficient decays until iteration 5000; if `training/reward` and
+  the evaluation metrics have plateaued well after that, stopping early is fine.
+- Shorter run: `--agent.max-iterations 3000`. Continue a stopped run:
+  `--resume-from runs/go2_contact/<run>:latest` (continues in a new run dir).
+
+## Pushing the trained weights to GitHub
+
+`runs/`, `*.pt` and `*.onnx` are git-ignored on purpose (checkpoints are written
+every 50 iterations). Publish only the final artefacts. `latest.pt` may be a
+symlink, so copy with `cp -L`.
+
+Option A: commit them into the repo (the Go2 GRU checkpoint is a few MB, well
+below GitHub's 100 MB per-file limit):
+
+```bash
+RUN=runs/go2_contact/<run>                       # the finished run dir
+mkdir -p weights/go2_contact
+cp -L $RUN/checkpoints/best.pt       weights/go2_contact/best.pt
+cp -L $RUN/exported/policy.onnx      weights/go2_contact/policy.onnx
+cp    $RUN/run_info.json $RUN/checkpoints/index.json weights/go2_contact/
+cp -r $RUN/config                    weights/go2_contact/config
+git add -f weights/go2_contact                   # -f: bypasses the *.pt / *.onnx ignore rules
+git commit -m "weights: go2_contact <run> best checkpoint + ONNX"
+git push origin audit/paper-alignment
+```
+
+After cloning, play it directly: `uv run contact-play Mjlab-Contact-Flat-Unitree-Go2 --checkpoint weights/go2_contact/best.pt`.
+
+Option B: attach them to a GitHub Release (keeps the git history small,
+recommended if you publish many runs), with the GitHub CLI:
+
+```bash
+gh release create go2-contact-v1 weights/go2_contact/best.pt weights/go2_contact/policy.onnx \
+  --title "Go2 contact policy v1" --notes "run <run>, iteration <it>"
+```
+
+For files above 100 MB use Git LFS (`git lfs track "*.pt"`) or a Release.
+
+## Commanding the robot after training
+
+**In simulation (Viser viewer).** Start the viewer on the server, open an SSH
+tunnel from your laptop, then open `http://localhost:8080`:
+
+```bash
+uv run contact-play Mjlab-Contact-Flat-Unitree-Go2 --checkpoint best --num-envs 1   # on the server
+ssh -N -L 8080:127.0.0.1:8080 <user>@<vps>                                          # on your laptop
+```
+
+The **Contact control** panel steers the policy through the same planner that
+generated the training goals:
+
+- **Gait**: `(as trained)`, trot, pace, bound, jump, crawl.
+- **Direction (deg)**: travel direction relative to the body (0 forward, 90
+  left, 180 backwards).
+- **Speed (m/s)**: converted to a stride (`stride = speed x period x S`). Speed
+  0 = step in place.
+- **Turning (rad/s)**: yaw rate. Training samples a direction *or* a turning
+  rate, never both, so combining them is out of distribution.
+- **Apply to all envs** (or only the selected env), **Apply command**,
+  **Restore trained commands**, **Restart episode (reset GRU)**.
+- **Checkpoint** panel: switch between saved checkpoints of the run without
+  restarting.
+
+Trained range: stride 0 to 0.3 m, i.e. about **0.43 m/s** max for trot / pace /
+bound / jump and about **0.21 m/s** for crawl, and turning up to pi rad/s.
+Larger values are applied but flagged as OUT OF TRAINING DISTRIBUTION in the
+panel (nothing is clamped).
+
+**From Python** (same pathway, e.g. for scripted tests):
+
+```python
+import math
+from contact_rl.tasks.contact.mdp.command_override import UserCommand, apply_to_command_term
+
+term = env.unwrapped.command_manager.get_term("contact")
+warnings = apply_to_command_term(term, UserCommand(gait="trot", speed=0.3, heading_offset=0.0, yaw_rate=0.0))
+# walk left: heading_offset=math.pi / 2 ; turn on the spot: speed=0.0, yaw_rate=1.0
+```
+
+**On the real Go2.** This repo contains no hardware deployment code. The
+exported `exported/policy.onnx` is the actor only (GRU hidden state is an extra
+input / output that must be carried between steps and zeroed on reset). A
+deployment has to rebuild the actor observation at 50 Hz exactly as in training
+(joint positions relative to default, joint velocities, last action, the 33-dim
+contact goal from `GaitPlanner` in the yaw-aligned base frame, feet-to-goal
+vectors from forward kinematics) and send the 12 outputs, scaled by
+`GO2_ACTION_SCALE` and added to the default joint positions, as PD position
+targets. Validate in simulation first.
