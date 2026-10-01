@@ -49,6 +49,24 @@ PPO, recurrent GRU actor & critic (rsl-rl `RNNModel`, 256 hidden, MLP head
 512-256-128), 24 steps/env, 5 epochs x 4 mini-batches, adaptive LR 1e-3,
 gamma 0.99, lambda 0.95, entropy decay 0.01 -> 0.001 over 5000 iterations, seed 42.
 
+### Posture regularisation (not in the paper)
+
+The contact rewards only look at the foot sites / foot geoms. With
+thigh = calf = 0.213 m a kneeling hind leg still has its foot sphere on the
+goal, so reach / hold / detach pay out in full, and a 2000-iteration run learned
+to walk on its hind knees in every gait. Three terms close that loophole
+(`contact_env_cfg.py`, functions in `mdp/rewards.py`):
+
+| Term | Function | Weight (per s) | What |
+| --- | --- | --- | --- |
+| `illegal_contact` | `undesired_contact_count` | -2.0 | number of non-foot collision geoms (base, hips, thighs, calves) touching the ground; sensor `illegal_contact` in `config/go2/env_cfgs.py` |
+| `base_height_below` | `base_height_below` | -10.0 | `max(0.25 - z_base, 0)`, one-sided and linear (jumps are never penalised) |
+| `base_tilt` | `base_tilt_l2` | -1.0 | squared xy of the projected gravity (constant roll / pitch) |
+
+Watch `Episode_Reward/illegal_contact` in TensorBoard: it should go to ~0.
+They change no observation, action or network shape, so older checkpoints can
+be resumed with them (next section).
+
 ## Installation
 
 `uv` workspace whose root is `contact-rl` and whose only member is the vendored
@@ -141,6 +159,61 @@ training has started (e.g. while the env is being built and Warp compiles its
 kernels) is a clean stop too: exit 0, `run_info.json` finalised as
 `status: "stopped"` (no checkpoint yet), further signals during that stop are
 ignored.
+
+## Continuing training from a finished checkpoint
+
+A run that reached `max_iterations` (`status: "finished"`) is resumed exactly
+like a stopped one. Example: the committed 2000-iteration checkpoint
+(`model_1999.pt` = iterations 0..1999), 3000 more iterations up to 5000:
+
+```bash
+uv run contact-train Mjlab-Contact-Flat-Unitree-Go2 \
+  --resume-from runs/go2_contact/2026-10-01_04-21-51/checkpoints/model_1999.pt \
+  --agent.max-iterations 3000
+# equivalent selector: runs/go2_contact/2026-10-01_04-21-51:1999
+```
+
+- `--agent.max-iterations` is the number of **additional** iterations
+  (`start .. start + N - 1`, printed at startup), not the final iteration.
+- Restored from the checkpoint: actor + critic weights (including the GRUs),
+  optimizer state and the iteration counter (training continues at
+  `iter + 1`). The entropy schedule uses the absolute iteration, so it simply
+  continues (0.0064 at iteration 2000, 0.001 from 5000).
+- **Not** restored: the env config. It is rebuilt from the current code and the
+  CLI flags, so reward / termination / domain-randomisation edits made after
+  the checkpoint take effect on resume.
+- Output goes to a **new** run dir; the source checkpoint is never written.
+  `best.pt` of the new run is ranked by the *new* reward, which is not
+  comparable with the old run's numbers.
+- If the checkpoint came from git, it must be the real file, not a Git LFS
+  pointer (`ls -lh` should show MBs, not ~130 bytes; `git lfs pull` if needed).
+
+What may change between the checkpoint and the resumed run:
+
+| Change | OK? | Note |
+| --- | --- | --- |
+| reward terms / weights | yes | expect a value-loss spike and a reward dip for ~100-200 iterations while the critic re-fits |
+| terminations, events, pushes, friction ranges | yes | add a new hard termination gradually (a penalty first), or many episodes end at once |
+| sensors that are not observations (e.g. `illegal_contact`) | yes | |
+| `--env.scene.num-envs` | yes | see below |
+| PPO hyper-parameters (`--agent.algorithm.*`) | yes | |
+| actor / critic observations | **no** | input size changes, `strict=True` load fails |
+| action space, network sizes, GRU size | **no** | same reason |
+| default task <-> `-Improved` task | **no** | different observations (IMU + normalisation) |
+
+**Different `num_envs` (e.g. 12000 -> 20000):** fine. The network does not
+depend on the number of envs, and each env's command (gait, strides, stance,
+heading / yaw rate) is sampled once when the env is built, so a larger count
+just covers more of the command space. A PPO iteration then collects
+`24 x num_envs` transitions and the 4 mini-batches get larger; the adaptive LR
+handles that. The real limits are VRAM and throughput: check first with
+`uv run contact-bench --num-envs 12000 16000 20000`, and if `env-steps/s` no
+longer grows, more envs only make each iteration slower.
+
+If the old policy is stuck in a bad local optimum (e.g. kneeling) and the new
+penalty does not remove it within a few hundred iterations, train from scratch
+instead: by iteration 2000 the action noise has already shrunk, which makes
+escaping it slow.
 
 ## Evaluation
 
