@@ -14,6 +14,12 @@ ablations. Each term is summed over feet and exposed as its own reward term so
 it can be weighted / logged independently.
 
 Foot-column ordering is asserted at startup by ``check_foot_ordering``.
+
+Posture regularisation (not in the paper, added after the 2000-iteration run
+learned to walk on its hind knees): the contact rewards only see the foot
+sites / foot geoms, so a kneeling leg whose foot sphere still touches the goal
+is paid in full. ``undesired_contact_count``, ``base_height_below`` and
+``base_tilt_l2`` close that loophole.
 """
 
 from __future__ import annotations
@@ -132,3 +138,42 @@ def joint_deviation_l2(
   default = asset.data.default_joint_pos
   jnt = asset_cfg.joint_ids
   return torch.sum(torch.square(asset.data.joint_pos[:, jnt] - default[:, jnt]), dim=1)
+
+
+##
+# Posture regularisation (anti-kneeling, see module docstring).
+##
+
+
+def undesired_contact_count(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
+  """Number of non-foot collision geoms (base, hips, thighs, calves) touching
+  the ground. ``sensor_name`` must be a ContactSensor recording ``found``."""
+  sensor: ContactSensor = env.scene[sensor_name]
+  if sensor.data.found is None:
+    raise RuntimeError(f"Sensor '{sensor_name}' must record the 'found' field.")
+  return (sensor.data.found > 0).float().sum(dim=1)
+
+
+def base_height_below(
+  env: ManagerBasedRlEnv,
+  target: float = 0.25,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """One-sided, linear: ``max(target - z_base, 0)`` (flat terrain).
+
+  Linear rather than squared: kneeling lowers the Go2 base by only ~5-6 cm,
+  whose square would be negligible. One-sided so jumps are never penalised.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  z = asset.data.root_link_pos_w[:, 2]
+  return torch.clamp(target - z, min=0.0)
+
+
+def base_tilt_l2(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Penalize a constant roll / pitch of the base (xy of projected gravity)."""
+  asset: Entity = env.scene[asset_cfg.name]
+  g = asset.data.projected_gravity_b
+  return torch.sum(torch.square(g[:, :2]), dim=1)

@@ -26,9 +26,12 @@ from .planning import (  # noqa: F401
 )
 from .rewards import (  # noqa: F401
   base_angular_velocity_l2,
+  base_height_below,
+  base_tilt_l2,
   contact_detach,
   contact_hold,
   contact_reach,
   goal_discovery_bonus,
   joint_deviation_l2,
+  undesired_contact_count,
 )

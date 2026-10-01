@@ -20,6 +20,11 @@ Faithfulness notes:
   * Rewards = reach + hold + detach (Eq. 1-3, paper kernel ``exp(-d/sigma^2)``)
     + goal-discovery bonus + the auxiliary penalties the paper lists. Weights
     are per-second rates (mjlab multiplies every term by ``step_dt``).
+  * Posture regularisation (NOT in the paper): ``illegal_contact``,
+    ``base_height_below`` and ``base_tilt``. Added because the contact rewards
+    only see the feet, and a 2000-iteration policy learned to walk on its hind
+    knees. The robot config must provide the ``ILLEGAL_CONTACT_SENSOR_NAME``
+    sensor (see ``config/go2/env_cfgs.py``).
 """
 
 from __future__ import annotations
@@ -50,6 +55,8 @@ FOOT_ORDER: tuple[str, ...] = ("FL", "FR", "RL", "RR")
 
 COMMAND_NAME = "contact"
 FEET_SENSOR_NAME = "feet_ground_contact"
+# Non-foot collision geoms vs terrain (knees, thighs, hips, body).
+ILLEGAL_CONTACT_SENSOR_NAME = "illegal_contact"
 
 # Spatial kernel of Eq. 1-2: exp(-d / sigma^2). The paper does not report
 # sigma; sigma^2 = 0.1 m gives an e-fold drop every 10 cm (the same length
@@ -57,6 +64,10 @@ FEET_SENSOR_NAME = "feet_ground_contact"
 # gradient out to ~0.5 m.
 CONTACT_SIGMA_SQ = 0.1
 CONTACT_KERNEL = "l2"
+
+# Posture regularisation. Go2 nominal standing base height is ~0.287 m
+# (robots/go2.py); 0.25 m leaves room for crouching before a jump.
+MIN_BASE_HEIGHT = 0.25
 
 
 def make_contact_env_cfg(actor_imu: bool = False) -> ManagerBasedRlEnvCfg:
@@ -275,6 +286,20 @@ def make_contact_env_cfg(actor_imu: bool = False) -> ManagerBasedRlEnvCfg:
     "action_rate": RewardTermCfg(func=mdp.action_rate_l2, weight=-0.01),
     # Standard joint-limit safety penalty (kept minimal).
     "dof_pos_limits": RewardTermCfg(func=mdp.joint_pos_limits, weight=-1.0),
+    # Posture regularisation (NOT in the paper; anti-kneeling, see docstring).
+    # One geom on the ground for a whole 20 s episode costs -40, the same order
+    # as the hold reward it was exploiting.
+    "illegal_contact": RewardTermCfg(
+      func=mdp.undesired_contact_count,
+      weight=-2.0,
+      params={"sensor_name": ILLEGAL_CONTACT_SENSOR_NAME},
+    ),
+    "base_height_below": RewardTermCfg(
+      func=mdp.base_height_below,
+      weight=-10.0,
+      params={"target": MIN_BASE_HEIGHT},
+    ),
+    "base_tilt": RewardTermCfg(func=mdp.base_tilt_l2, weight=-1.0),
   }
 
   ##

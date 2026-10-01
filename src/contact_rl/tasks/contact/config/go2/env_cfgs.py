@@ -10,11 +10,20 @@ from contact_rl.robots.go2 import GO2_ACTION_SCALE, get_go2_robot_cfg
 from contact_rl.tasks.contact.contact_env_cfg import (
   FEET_SENSOR_NAME,
   FOOT_ORDER,
+  ILLEGAL_CONTACT_SENSOR_NAME,
   make_contact_env_cfg,
 )
 
 # Foot collision geoms, ordered to match ``FOOT_ORDER`` (FL, FR, RL, RR).
 _FOOT_GEOMS = tuple(f"{name}_foot_collision" for name in FOOT_ORDER)
+
+# Every non-foot collision geom of go2.xml. Ground contact on any of them
+# (knees / calves, thighs, hips, body) is penalised by ``illegal_contact``.
+_ILLEGAL_GEOMS = ("base1_collision", "base2_collision", "base3_collision") + tuple(
+  f"{leg}_{part}_collision"
+  for leg in FOOT_ORDER
+  for part in ("hip", "thigh", "calf1", "calf2")
+)
 
 # Paper, Section 4 "Training": 8192 parallel environments. Override with
 # ``--env.scene.num-envs`` on smaller GPUs (``contact-bench`` helps pick one).
@@ -47,7 +56,17 @@ def unitree_go2_flat_env_cfg(
     num_slots=1,
     track_air_time=True,
   )
-  cfg.scene.sensors = (cfg.scene.sensors or ()) + (feet_ground_cfg,)
+  # Non-foot / ground contact sensor (anti-kneeling penalty). Geom mode, not
+  # body mode: the foot sphere lives inside the calf body.
+  illegal_ground_cfg = ContactSensorCfg(
+    name=ILLEGAL_CONTACT_SENSOR_NAME,
+    primary=ContactMatch(mode="geom", pattern=_ILLEGAL_GEOMS, entity="robot"),
+    secondary=ContactMatch(mode="body", pattern="terrain"),
+    fields=("found",),
+    reduce="netforce",
+    num_slots=1,
+  )
+  cfg.scene.sensors = (cfg.scene.sensors or ()) + (feet_ground_cfg, illegal_ground_cfg)
 
   joint_pos_action = cfg.actions["joint_pos"]
   assert isinstance(joint_pos_action, JointPositionActionCfg)
