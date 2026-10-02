@@ -18,8 +18,10 @@ Foot-column ordering is asserted at startup by ``check_foot_ordering``.
 Posture regularisation (not in the paper, added after the 2000-iteration run
 learned to walk on its hind knees): the contact rewards only see the foot
 sites / foot geoms, so a kneeling leg whose foot sphere still touches the goal
-is paid in full. ``undesired_contact_count``, ``base_height_below`` and
-``base_tilt_l2`` close that loophole.
+is paid in full. ``undesired_contact_count``, ``base_height_below``,
+``base_tilt_l2`` and ``knee_height_below`` close that loophole. The binary
+contact count alone is not enough: a knee hovering a few mm above the floor
+costs nothing, so ``knee_height_below`` adds a dense, geometric penalty.
 """
 
 from __future__ import annotations
@@ -161,8 +163,10 @@ def base_height_below(
 ) -> torch.Tensor:
   """One-sided, linear: ``max(target - z_base, 0)`` (flat terrain).
 
-  Linear rather than squared: kneeling lowers the Go2 base by only ~5-6 cm,
-  whose square would be negligible. One-sided so jumps are never penalised.
+  Linear rather than squared so small drops still register. One-sided so
+  jumps are never penalised. NOTE: measured at the base centre, so kneeling on
+  the hind legs only (front legs straight) barely moves it; the dense
+  anti-kneeling signal is ``knee_height_below``.
   """
   asset: Entity = env.scene[asset_cfg.name]
   z = asset.data.root_link_pos_w[:, 2]
@@ -177,3 +181,23 @@ def base_tilt_l2(
   asset: Entity = env.scene[asset_cfg.name]
   g = asset.data.projected_gravity_b
   return torch.sum(torch.square(g[:, :2]), dim=1)
+
+
+def knee_height_below(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg,
+  min_height: float = 0.08,
+) -> torch.Tensor:
+  """Dense anti-kneeling penalty (flat terrain), summed over legs.
+
+  ``sum_legs max(min_height - z_knee, 0) / min_height`` in [0, n_legs], where
+  ``z_knee`` is the world height of the calf body origin (= knee joint).
+  ``asset_cfg.body_names`` must select the calf bodies (e.g. ``".*_calf"``).
+
+  Go2: nominal knee height ~0.155 m, kneeling ~0.015 m. Unlike the binary
+  ``undesired_contact_count`` it cannot be gamed by hovering the knee a few mm
+  above the floor, and it gives a gradient before touch-down.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  z = asset.data.body_link_pos_w[:, asset_cfg.body_ids, 2]
+  return (torch.clamp(min_height - z, min=0.0) / min_height).sum(dim=1)

@@ -33,5 +33,6 @@ from .rewards import (  # noqa: F401
   contact_reach,
   goal_discovery_bonus,
   joint_deviation_l2,
+  knee_height_below,
   undesired_contact_count,
 )
