@@ -19,6 +19,10 @@ Both modes write, to ``--out-dir`` (default ``<run>/metrics/iteration_<it>``)::
 
 and append one row to ``<run>/metrics/evaluations.csv``.
 
+Posture diagnostics are additive: per-leg knee heights, low-knee time and
+non-foot contact time. Legacy ``success`` still means survival, not healthy
+gait. See ``docs/POSTURE_AUDIT.md`` for limitations and validation commands.
+
 ``--source-checkpoint``: the checkpoint the evaluated file is a copy of.
 ``contact-watch`` evaluates a temporary hard-linked snapshot (deleted after
 the evaluation) and passes the original ``checkpoints/model_<it>.pt`` here so
@@ -101,11 +105,13 @@ def rollout(cfg: EvalConfig, ckpt: Path, device: str, gait: str | None, duration
   from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
   from mjlab.tasks.registry import load_env_cfg, load_rl_cfg, load_runner_cls
 
+  from contact_rl.tasks.contact.contact_env_cfg import ILLEGAL_CONTACT_SENSOR_NAME
   from contact_rl.tasks.contact.mdp import ContactGoalCommand
   from contact_rl.tasks.contact.mdp.command_override import describe_command
   from contact_rl.tasks.contact.mdp.planning import unit
-  from contact_rl.utils.episode_metrics import EpisodeAccumulator, classify
+  from contact_rl.utils.episode_metrics import classify
   from contact_rl.utils.policy_state import reset_recurrent_state
+  from contact_rl.utils.posture_metrics import FOOT_ORDER, PostureAccumulator
   from contact_rl.utils.video import Hud, StreamingVideoWriter
 
   env_cfg = load_env_cfg(cfg.task, play=True)
@@ -140,7 +146,14 @@ def rollout(cfg: EvalConfig, ckpt: Path, device: str, gait: str | None, duration
     tm = env.termination_manager
     n = env.num_envs
     zeros_b = torch.zeros(n, dtype=torch.bool, device=device)
-    acc = EpisodeAccumulator(torch.zeros(n, device=device))
+    # Resolve explicitly: per-leg diagnostics must not silently permute knees.
+    expected_knees = tuple(f"{leg}_calf" for leg in FOOT_ORDER)
+    knee_ids, knee_names = robot.find_bodies(list(expected_knees), preserve_order=True)
+    if tuple(knee_names) != expected_knees:
+      raise ValueError(f"Expected knees {expected_knees}, resolved {tuple(knee_names)}")
+    illegal_sensor = env.scene[ILLEGAL_CONTACT_SENSOR_NAME]
+    knee_threshold = env_cfg.rewards["knee_height"].params["min_height"]
+    acc = PostureAccumulator(torch.zeros(n, device=device), min_height=knee_threshold)
     writer = StreamingVideoWriter(video_path, fps=1.0 / env.step_dt) if video_path else None
     hud = Hud(cfg.hud)
     video_err = None
@@ -163,9 +176,14 @@ def rollout(cfg: EvalConfig, ckpt: Path, device: str, gait: str | None, duration
         i_act = term.actual_contact()
         dist = torch.norm(term.foot_pos_w() - goal, dim=-1)
         in_c = ((i_con > 0.5) & (i_act > 0.5)).float()
+        illegal_found = illegal_sensor.data.found
+        if illegal_found is None:
+          raise RuntimeError("Posture evaluation requires illegal_contact.found")
         acc.step(
           rew,
           reason,
+          knee_heights=robot.data.body_link_pos_w[:, knee_ids, 2],
+          illegal_found=illegal_found,
           hamming=(i_con - i_act).abs().sum(dim=1),
           loc_err_sum=(dist * in_c).sum(dim=1),
           loc_cnt=in_c.sum(dim=1),
@@ -232,7 +250,7 @@ def write_outputs(cfg: EvalConfig, ckpt: Path, run_dir: Path, out_dir: Path, vid
   """Write ``metrics.csv``, ``summary.json`` and the ``evaluations.csv`` row.
   Raises SystemExit on an empty evaluation."""
   from contact_rl.utils import runtime as rt
-  from contact_rl.utils.episode_metrics import summarize
+  from contact_rl.utils.posture_metrics import summarize
 
   if not rows:
     raise SystemExit(f"[eval] evaluation of {ckpt} produced no episodes; nothing written to {out_dir}")
@@ -261,6 +279,11 @@ def write_outputs(cfg: EvalConfig, ckpt: Path, run_dir: Path, out_dir: Path, vid
   print(f"[eval] fall={o['fall_rate']:.3f} timeout={o['timeout_rate']:.3f} success={o['success_rate']:.3f} "
         f"reward={o['reward_mean']:.2f} loc_err={o['contact_location_error_cm_mean']:.2f}cm "
         f"hamming={o['contact_plan_hamming_mean']:.3f} v_err={o['lin_vel_error_mps_mean']:.3f}")
+  if "knee_below_fraction_pooled" in o:
+    print(f"[posture] low_knee={o['knee_below_fraction_pooled']:.3f} "
+          f"illegal_contact={o['illegal_contact_fraction_pooled']:.3f} "
+          f"invalid_samples={o['posture_invalid_samples_total']} "
+          "(success above is survival only)")
   if cfg.tensorboard:
     _log_tensorboard(run_dir, it, o)
   _append_history(run_dir, it, source, o)
@@ -270,7 +293,7 @@ def write_outputs(cfg: EvalConfig, ckpt: Path, run_dir: Path, out_dir: Path, vid
 def evaluate(cfg: EvalConfig) -> dict:
   from contact_rl.utils import checkpoints as ck
   from contact_rl.utils import runtime as rt
-  from contact_rl.utils.episode_metrics import summarize
+  from contact_rl.utils.posture_metrics import summarize
 
   ckpt = _checkpoint(cfg)
   device = rt.resolve_device(cfg.device)
