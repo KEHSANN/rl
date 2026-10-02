@@ -1,29 +1,30 @@
 """Additive posture diagnostics for flat-ground Go2 evaluation.
 
-The historical success flag measures survival, not gait quality. This module
-preserves all EpisodeAccumulator fields and adds independent posture evidence.
-Post-step terminal states are auto-reset poses and are excluded, as in the
-legacy accumulator. Contact samples are instantaneous at policy frequency;
-these metrics do not claim to detect every physics-substep impact.
+Legacy success means survival, not healthy gait. Terminal post-step states
+are auto-reset poses and are excluded. Contact is sampled at policy frequency,
+not over all physics substeps. Importing summaries does not require torch.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Any
-
-import torch
+from typing import TYPE_CHECKING, Any
 
 from contact_rl.utils.episode_metrics import EpisodeAccumulator
 from contact_rl.utils.episode_metrics import summarize as summarize_legacy
+
+if TYPE_CHECKING:
+  import torch
 
 FOOT_ORDER = ("FL", "FR", "RL", "RR")
 
 
 class PostureAccumulator(EpisodeAccumulator):
-  """Torch rollout accumulator; adds fields without redefining legacy success."""
+  """Torch rollout accumulator; preserves legacy fields and success semantics."""
 
   def __init__(self, zeros: torch.Tensor, min_height: float = 0.08):
+    import torch
+
     if not math.isfinite(min_height) or min_height <= 0:
       raise ValueError("min_height must be finite and positive")
     if zeros.ndim != 1:
@@ -48,6 +49,8 @@ class PostureAccumulator(EpisodeAccumulator):
     illegal_found: torch.Tensor,
     **kwargs: Any,
   ) -> None:
+    import torch
+
     n = len(self.active)
     if knee_heights.shape != (n, 4):
       raise ValueError("knee_heights must have shape [N, 4] in FL/FR/RL/RR order")
@@ -77,9 +80,12 @@ class PostureAccumulator(EpisodeAccumulator):
     rows = super().rows(step_dt, extra)
     samples = self.posture_samples.tolist()
     invalid = self.invalid_samples.tolist()
-    heights, minima, below = self.height_sum.tolist(), self.height_min.tolist(), self.below_sum.tolist()
+    heights = self.height_sum.tolist()
+    minima = self.height_min.tolist()
+    below = self.below_sum.tolist()
     any_below = self.any_below_sum.tolist()
-    contacts, counts = self.contact_sum.tolist(), self.contact_count_sum.tolist()
+    contacts = self.contact_sum.tolist()
+    counts = self.contact_count_sum.tolist()
     for i, row in enumerate(rows):
       n = samples[i]
       denom = n if n else float("nan")
