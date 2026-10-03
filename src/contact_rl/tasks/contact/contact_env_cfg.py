@@ -1,23 +1,30 @@
 """Contact-explicit locomotion task configuration.
 
-Factory ``make_contact_env_cfg`` builds the base (robot-agnostic) config for the
+``make_contact_env_cfg`` builds the robot-agnostic base config for the
 contact-explicit multi-gait locomotion task of Omar & Khadiv
-(arXiv:2510.03599v2). Robot-specific configs (see ``config/go2``) call the
-factory and fill in the per-robot names / scales.
+(arXiv:2510.03599v2). Robot-specific configs (``config/go2``) fill in names and
+scales.
 
 Faithfulness notes:
-  * Actor observations = proprioception (joint pos, joint vel, last action) +
-    task observations (contact goal = current+next contact sequence & locations
-    in base frame + command duration, and relative feet->goal distance). No
-    height scan and no foot-contact sensing in the actor, exactly as the paper
-    states.
-  * The critic is asymmetric (privileged): it additionally sees base linear /
-    angular velocity, projected gravity, and actual foot contact. This does not
-    change the deployed policy's input contract.
-  * Rewards = reach + hold + detach (Eq. 1-3) + goal-discovery bonus, plus the
-    auxiliary penalties the paper lists (base angular velocity, joint velocity,
-    acceleration, torque, joint deviation, action rate). Reward weights are
-    per-second rates (mjlab dt-scales them by ``step_dt``); tune as needed.
+  * Actor observations (default, ``actor_imu=False``) = proprioception (joint
+    pos, joint vel, last action) + task observations (current & next contact
+    sequence, current & next contact locations in the base frame, remaining
+    command time ``s``, feet->goal relative vectors). No height scan and no
+    foot-contact sensing, exactly as the paper lists.
+  * ``actor_imu=True`` (EXPERIMENTAL, used by the ``-Improved`` task) adds the
+    IMU signals (base angular velocity, projected gravity) that the Go2 has on
+    board. The paper's list is introduced with "such as", so this is a
+    plausible reading, but it is *not* stated -- hence kept opt-in.
+  * The critic is asymmetric (privileged): base lin/ang velocity, projected
+    gravity and actual foot contact on top of the actor observations.
+  * Rewards = reach + hold + detach (Eq. 1-3, paper kernel ``exp(-d/sigma^2)``)
+    + goal-discovery bonus + the auxiliary penalties the paper lists. Weights
+    are per-second rates (mjlab multiplies every term by ``step_dt``).
+  * Posture regularisation (NOT in the paper): ``illegal_contact``,
+    ``knee_height``, ``base_height_below`` and ``base_tilt``. Added because the
+    contact rewards only see the feet, and a 2000-iteration policy learned to
+    walk on its hind knees. The robot config must provide the
+    ``ILLEGAL_CONTACT_SENSOR_NAME`` sensor (see ``config/go2/env_cfgs.py``).
 """
 
 from __future__ import annotations
@@ -48,16 +55,31 @@ FOOT_ORDER: tuple[str, ...] = ("FL", "FR", "RL", "RR")
 
 COMMAND_NAME = "contact"
 FEET_SENSOR_NAME = "feet_ground_contact"
+# Non-foot collision geoms vs terrain (knees, thighs, hips, body).
+ILLEGAL_CONTACT_SENSOR_NAME = "illegal_contact"
+
+# Spatial kernel of Eq. 1-2: exp(-d / sigma^2). The paper does not report
+# sigma; sigma^2 = 0.1 m gives an e-fold drop every 10 cm (the same length
+# scale as the previous Gaussian with std = 0.1 m) but keeps a useful
+# gradient out to ~0.5 m.
+CONTACT_SIGMA_SQ = 0.1
+CONTACT_KERNEL = "l2"
+
+# Posture regularisation. Go2 nominal standing base height is ~0.287 m
+# (robots/go2.py); 0.25 m leaves room for crouching before a jump.
+MIN_BASE_HEIGHT = 0.25
+# Knee (calf body origin) clearance. Go2 nominal knee height ~0.155 m, a knee
+# on the floor ~0.015 m; 0.08 m leaves normal gaits and crouches untouched.
+MIN_KNEE_HEIGHT = 0.08
 
 
-def make_contact_env_cfg() -> ManagerBasedRlEnvCfg:
+def make_contact_env_cfg(actor_imu: bool = False) -> ManagerBasedRlEnvCfg:
   """Create the base contact-explicit locomotion task configuration."""
 
   ##
   # Observations.
   ##
 
-  # Actor: proprioception + task observations only (paper-faithful).
   actor_terms = {
     "joint_pos": ObservationTermCfg(
       func=mdp.joint_pos_rel,
@@ -78,8 +100,14 @@ def make_contact_env_cfg() -> ManagerBasedRlEnvCfg:
       noise=Unoise(n_min=-0.02, n_max=0.02),
     ),
   }
+  if actor_imu:
+    actor_terms["base_ang_vel"] = ObservationTermCfg(
+      func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2)
+    )
+    actor_terms["projected_gravity"] = ObservationTermCfg(
+      func=mdp.projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05)
+    )
 
-  # Critic: privileged (asymmetric) observations.
   critic_terms = {
     **actor_terms,
     "base_lin_vel": ObservationTermCfg(func=mdp.base_lin_vel),
@@ -125,6 +153,7 @@ def make_contact_env_cfg() -> ManagerBasedRlEnvCfg:
     COMMAND_NAME: mdp.ContactGoalCommandCfg(
       entity_name="robot",
       foot_site_names=FOOT_ORDER,
+      sensor_name=FEET_SENSOR_NAME,
       resampling_time_range=(0.34, 0.36),
       debug_vis=True,
     ),
@@ -135,9 +164,8 @@ def make_contact_env_cfg() -> ManagerBasedRlEnvCfg:
   ##
 
   events = {
-    # NOTE: ``z`` is an offset on top of the robot's nominal standing height, so
-    # keep the range small -- a large offset makes every episode start with a
-    # free fall that eats a sizeable fraction of the first command window.
+    # ``z`` is an offset on top of the nominal standing height; keep it small
+    # so episodes do not start with a long free fall.
     "reset_base": EventTermCfg(
       func=mdp.reset_root_state_uniform,
       mode="reset",
@@ -206,9 +234,7 @@ def make_contact_env_cfg() -> ManagerBasedRlEnvCfg:
         },
       },
     ),
-    # Fail fast if the goal buffers, the foot sites and the contact sensor ever
-    # stop agreeing on the foot column order (both name resolvers default to
-    # model order, so this is a real failure mode, not a theoretical one).
+    # Fail fast if goals, foot sites and contact sensor disagree on foot order.
     "check_foot_ordering": EventTermCfg(
       mode="startup",
       func=mdp.check_foot_ordering,
@@ -224,75 +250,70 @@ def make_contact_env_cfg() -> ManagerBasedRlEnvCfg:
   # Rewards.
   ##
 
+  contact_params = {"command_name": COMMAND_NAME, "sensor_name": FEET_SENSOR_NAME}
   rewards = {
     # Contact-explicit rewards (Section 3.2, Eq. 1-3).
     "reach": RewardTermCfg(
       func=mdp.contact_reach,
       weight=1.0,
-      params={
-        "command_name": COMMAND_NAME,
-        "sensor_name": FEET_SENSOR_NAME,
-        "std": 0.1,  # std=1 reproduces the literal exp(-d^2); smaller sharpens.
-      },
+      params={**contact_params, "sigma_sq": CONTACT_SIGMA_SQ, "kernel": CONTACT_KERNEL},
     ),
     "hold": RewardTermCfg(
       func=mdp.contact_hold,
       weight=1.0,
       params={
-        "command_name": COMMAND_NAME,
-        "sensor_name": FEET_SENSOR_NAME,
-        "hold_lambda": 1.0,
-        "std": 0.1,
+        **contact_params,
+        "hold_alpha": 1.0,
+        "sigma_sq": CONTACT_SIGMA_SQ,
+        "kernel": CONTACT_KERNEL,
       },
     ),
     "detach": RewardTermCfg(
       func=mdp.contact_detach,
       weight=0.5,
-      params={
-        "command_name": COMMAND_NAME,
-        "sensor_name": FEET_SENSOR_NAME,
-      },
+      params=dict(contact_params),
     ),
     "goal_discovery": RewardTermCfg(
       func=mdp.goal_discovery_bonus,
-      # This is an *event* indicator (fires on the step a goal is discovered),
-      # but mjlab dt-scales every reward term by step_dt=0.02, so the weight is
-      # 50x smaller than it reads: 25.0 -> 0.5 per discovery. Together with
-      # ``goal_dwell_frac`` the rate is capped at ~2x the nominal switch rate,
-      # which keeps this well below the hold reward's ~8/s ceiling.
+      # Event indicator (fires on the discovery step, at most once per switch);
+      # mjlab multiplies by step_dt = 0.02, so 25.0 -> 0.5 per discovery.
       weight=25.0,
       params={"command_name": COMMAND_NAME},
     ),
     # Auxiliary locomotion penalties named by the paper.
-    "base_ang_vel": RewardTermCfg(
-      func=mdp.base_angular_velocity_l2,
-      weight=-0.05,
-    ),
-    "joint_vel": RewardTermCfg(
-      func=mdp.joint_vel_l2,
-      weight=-1.0e-3,
-    ),
-    "joint_acc": RewardTermCfg(
-      func=mdp.joint_acc_l2,
-      weight=-2.5e-7,
-    ),
-    "joint_torques": RewardTermCfg(
-      func=mdp.joint_torques_l2,
-      weight=-2.0e-4,
-    ),
-    "joint_deviation": RewardTermCfg(
-      func=mdp.joint_deviation_l2,
-      weight=-0.05,
-    ),
-    "action_rate": RewardTermCfg(
-      func=mdp.action_rate_l2,
-      weight=-0.01,
-    ),
+    "base_ang_vel": RewardTermCfg(func=mdp.base_angular_velocity_l2, weight=-0.05),
+    "joint_vel": RewardTermCfg(func=mdp.joint_vel_l2, weight=-1.0e-3),
+    "joint_acc": RewardTermCfg(func=mdp.joint_acc_l2, weight=-2.5e-7),
+    "joint_torques": RewardTermCfg(func=mdp.joint_torques_l2, weight=-2.0e-4),
+    "joint_deviation": RewardTermCfg(func=mdp.joint_deviation_l2, weight=-0.05),
+    "action_rate": RewardTermCfg(func=mdp.action_rate_l2, weight=-0.01),
     # Standard joint-limit safety penalty (kept minimal).
-    "dof_pos_limits": RewardTermCfg(
-      func=mdp.joint_pos_limits,
-      weight=-1.0,
+    "dof_pos_limits": RewardTermCfg(func=mdp.joint_pos_limits, weight=-1.0),
+    # Posture regularisation (NOT in the paper; anti-kneeling, see docstring).
+    # A kneeling stance foot still earns up to 2/s of hold reward, so each
+    # kneeling leg must cost clearly more than that.
+    # Binary: one geom on the ground costs 4/s.
+    "illegal_contact": RewardTermCfg(
+      func=mdp.undesired_contact_count,
+      weight=-4.0,
+      params={"sensor_name": ILLEGAL_CONTACT_SENSOR_NAME},
     ),
+    # Dense: a knee at ~0.015 m costs ~0.8 * 5 = 4/s, and it cannot be dodged by
+    # hovering the knee just above the floor (which the binary term allows).
+    "knee_height": RewardTermCfg(
+      func=mdp.knee_height_below,
+      weight=-5.0,
+      params={
+        "min_height": MIN_KNEE_HEIGHT,
+        "asset_cfg": SceneEntityCfg("robot", body_names=(".*_calf",)),
+      },
+    ),
+    "base_height_below": RewardTermCfg(
+      func=mdp.base_height_below,
+      weight=-10.0,
+      params={"target": MIN_BASE_HEIGHT},
+    ),
+    "base_tilt": RewardTermCfg(func=mdp.base_tilt_l2, weight=-1.0),
   }
 
   ##
@@ -314,7 +335,7 @@ def make_contact_env_cfg() -> ManagerBasedRlEnvCfg:
   return ManagerBasedRlEnvCfg(
     scene=SceneCfg(
       terrain=TerrainEntityCfg(terrain_type="plane"),
-      num_envs=4096,  # Paper uses 8192; override via CLI as GPU memory allows.
+      num_envs=4096,  # Paper: 8192. Pick with `contact-bench` for your GPU.
       extent=2.0,
     ),
     observations=observations,

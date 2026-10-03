@@ -1,271 +1,502 @@
-# Learning to Act Through Contact — mjlab implementation
+# Learning to Act Through Contact: mjlab implementation
 
 An implementation of
 
 > **Learning to Act Through Contact: A Unified View of Multi-Task Robot Learning**
-> Shafeef Omar, Majid Khadiv (TUM), LDC 2026 — arXiv:2510.03599v2
+> Shafeef Omar, Majid Khadiv (TUM), L4DC 2026, arXiv:2510.03599v2
 
 on top of [mjlab](https://github.com/mujocolab/mjlab) (Isaac-Lab-style,
-manager-based RL powered by MuJoCo-Warp).
+manager-based RL on MuJoCo-Warp).
 
-The paper's central idea is **contact-explicit, goal-conditioned RL**: instead of
-commanding a *velocity target* (locomotion) or a *reference motion* (imitation),
-the policy is conditioned on **contact goals** — where and when each
-end-effector should make or break contact. A single reward formulation
-(reach / hold / detach) then covers a whole family of tasks and gaits.
+## Project overview
 
-This repository implements **only that paper**. The `.mjlab_ref` recipe and any
-other bundled references are used for framework plumbing only; none of their
-*tasks* (mjlab's velocity target, mjlab's motion tracking) are mixed in — those
-are exactly the paradigms this paper argues against.
+The policy is conditioned on **contact goals** (where and when each
+end-effector should make or break contact) instead of velocity targets or
+reference motions. One reward formulation (reach / hold / detach) covers a whole
+family of gaits. Scope: **Unitree Go2**, flat terrain, multi-gait locomotion
+(trot / pace / bound / jump / crawl).
 
-Scope of this implementation: the **Unitree Go2 quadruped**, flat terrain,
-multi-gait locomotion (trot / pace / bound / jump / crawl) via contact goals.
-Manipulation (the paper's humanoid results) is intentionally out of scope for
-now (see *Future work*).
+Architecture: task + MDP code under `src/contact_rl/tasks/contact/`, a project
+runner (`config/go2/runner.py`: entropy decay, checkpoint management, ONNX
+export, graceful stop), and six CLIs under `src/contact_rl/scripts/` with
+shared utilities in `src/contact_rl/utils/`. See [`docs/AUDIT.md`](docs/AUDIT.md)
+for the paper/code gap analysis.
 
----
+| Task id | What |
+| --- | --- |
+| `Mjlab-Contact-Flat-Unitree-Go2` | Paper-faithful implementation (default). Runs under `runs/go2_contact/`. |
+| `Mjlab-Contact-Flat-Unitree-Go2-Improved` | **Experimental**: + IMU (base angular velocity, projected gravity) in the actor and running observation normalisation on actor *and* critic. Runs under `runs/go2_contact_improved/`. |
 
-## The contact goal (what conditions the policy)
+### The contact goal
 
-For each foot `e` and control step `t` (Section 3.1), over a horizon of **two
-contact switches** (current + next):
+For each foot `e`, over a horizon of **two contact switches** (paper 3.2):
+current / next contact location `p^con_{e,1..2}` (yaw-aligned base frame,
+4 x 2 x 3), indicators `I^con_{e,1..2}` (4 x 2) and remaining goal time `s`
+(`S ~ U[0.34, 0.36] s`). Phases: **reach** `I^con_1 = 0 and s <= delta`,
+**hold** `I^con_1 = 1`, **detach** `I^con_1 = 0 and s > delta` (delta = 0.18 s).
 
-| Symbol | Meaning | Shape (per env) |
+```
+reach  = exp(-d(p1, p_act) / sigma^2) * 1[I^con_1 = 0 and s <= delta]
+hold   = (1 + alpha_hold * exp(-d / sigma^2)) * 1[I^con_1 = I^act = 1]
+detach = 1[I^con_1 = I^act = 0 and s > delta]
+```
+
+sigma^2 = 0.1 m, alpha_hold = 1. Planner: `mdp/planning.py`. Actor observations:
+joint pos/vel, last action, contact goal, feet-to-goal vectors; the critic adds
+privileged base velocities, projected gravity and foot contact.
+
+PPO, recurrent GRU actor & critic (rsl-rl `RNNModel`, 256 hidden, MLP head
+512-256-128), 24 steps/env, 5 epochs x 4 mini-batches, adaptive LR 1e-3,
+gamma 0.99, lambda 0.95, entropy decay 0.01 -> 0.001 over 5000 iterations, seed 42.
+
+### Posture regularisation (not in the paper)
+
+The contact rewards only look at the foot sites / foot geoms. With
+thigh = calf = 0.213 m a kneeling hind leg still has its foot sphere on the
+goal, so reach / hold / detach pay out in full, and a 2000-iteration run learned
+to walk on its hind knees in every gait. Three terms close that loophole
+(`contact_env_cfg.py`, functions in `mdp/rewards.py`):
+
+| Term | Function | Weight (per s) | What |
+| --- | --- | --- | --- |
+| `illegal_contact` | `undesired_contact_count` | -2.0 | number of non-foot collision geoms (base, hips, thighs, calves) touching the ground; sensor `illegal_contact` in `config/go2/env_cfgs.py` |
+| `base_height_below` | `base_height_below` | -10.0 | `max(0.25 - z_base, 0)`, one-sided and linear (jumps are never penalised) |
+| `base_tilt` | `base_tilt_l2` | -1.0 | squared xy of the projected gravity (constant roll / pitch) |
+
+Watch `Episode_Reward/illegal_contact` in TensorBoard: it should go to ~0.
+They change no observation, action or network shape, so older checkpoints can
+be resumed with them (next section).
+
+## Installation
+
+`uv` workspace whose root is `contact-rl` and whose only member is the vendored
+`mjlab` (`.mjlab_ref`). The committed `uv.lock` pins the full graph; resolution
+is narrowed to Linux x86_64 (`[tool.uv] environments`).
+
+```bash
+uv sync --extra cu128 --python 3.12 --frozen   # Linux x86_64 + NVIDIA GPU
+uv sync --extra cpu --frozen                   # CPU smoke tests only
+.venv/bin/python scripts/patches/patch_mujoco_warp_sensor.py   # required, see below
+export UV_NO_SYNC=1                            # see below
+uv run contact-doctor                          # machine-readiness report
+```
+
+`scripts/vps/setup.sh` performs the sync, the patch and the doctor check for
+you (and `scripts/vps/common.sh` exports `UV_NO_SYNC=1`); run the commands
+above by hand only if you are not using it.
+
+**Post-sync patch (required):** `mujoco-warp==3.5.0.2` generates its sensor
+kernels from `mujoco_warp/_src/sensor.py`, whose `UNKNOWN` frame-axis branch
+reads `xmat` before it is assigned; Warp rejects the generated kernel and env
+construction fails. `scripts/patches/patch_mujoco_warp_sensor.py` inserts the
+missing `xmat` initialisation into the **installed** package. It is SHA256-gated
+(it refuses to touch an unexpected file), idempotent, atomic, and must be re-run
+after every `uv sync` that reinstalls `mujoco-warp`, because the edit lives in
+`.venv`, not in this repo.
+
+**`UV_NO_SYNC=1`:** `uv run` normally re-syncs the project env before every
+command, and without `--extra cu128` that sync targets the *no-extra*
+resolution: it silently replaces the CUDA torch build installed above with a
+different torch wheel. Sync once, explicitly (`uv sync --extra ...` or
+`scripts/vps/setup.sh`), then run everything with `UV_NO_SYNC=1` exported or
+as `uv run --no-sync ...` (`--no-sync` implies `--frozen`). The VPS scripts
+(`scripts/vps/common.sh`, also inside tmux sessions) and the systemd units set
+it for you. Re-sync after a `git pull` that changes `uv.lock`. All `uv run`
+commands below assume it is set.
+
+Dependency-resolution notes (do not undo; details in `pyproject.toml`):
+`mujoco-warp==3.5.0.2` comes from PyPI rather than mjlab's git rev, and the
+`cu128` / `cpu` extras exist only on the workspace root.
+
+Two fixes carried in the vendored mjlab (`.mjlab_ref`):
+`scipy` is declared as a dependency because `mjlab.terrains` imports it while
+upstream never listed it, and `sim/sim.py` uses `wp.get_cuda_driver_version()`
+instead of `wp.context.runtime.driver_version`, which warp 1.16 no longer
+exposes (it raises `AttributeError`, disabling CUDA graphs).
+
+Headless rendering: importing `contact_rl` configures `MUJOCO_GL` (EGL on
+headless machines) *before* MuJoCo is imported; an explicitly exported
+`MUJOCO_GL` is always respected.
+
+| Command | Module | Purpose |
 | --- | --- | --- |
-| `p^con_{e,t,1}`, `p^con_{e,t,2}` | current / next desired contact location (base frame) | 2 × 4 × 3 |
-| `I^con_{e,t,1}`, `I^con_{e,t,2}` | current / next desired contact indicator (0/1) | 2 × 4 |
-| `S` | command duration of the current goal | 1 |
+| `contact-train` | `contact_rl.scripts.train` | training with run management |
+| `contact-eval` | `contact_rl.scripts.evaluate` | per-episode evaluation (Fig. 6 protocol) |
+| `contact-watch` | `contact_rl.scripts.watch` | evaluates new checkpoints of a running job |
+| `contact-play` | `contact_rl.scripts.play` | viewer / video for a checkpoint |
+| `contact-doctor` | `contact_rl.scripts.doctor` | environment diagnostics |
+| `contact-bench` | `contact_rl.scripts.benchmark` | hardware report + env-throughput sweep |
 
-Stacking `I^con` over the feet is the **contact sequence**; the per-gait
-sequences produce trot / pace / bound / jump / crawl.
+Every command supports `--help`. `contact-train` and `contact-play` take the
+task id as a positional argument, so their help is two-level: `contact-train
+--help` lists the task ids plus the contact-train-only flags, while the full
+`--env.*` / `--agent.*` option list is built from the selected task and needs
+`contact-train <task> --help`.
 
-The **contact phase** of a foot (Fig. 3) follows from `I^con_{e,t,1}` and the
-remaining command time `s` vs a threshold `ν`:
-
-- **reach**  — `I^con_1 == 0` and `s < ν`
-- **hold**   — `I^con_1 == 1`
-- **detach** — `I^con_1 == 0` and `s > ν`
-
-### Rewards (Section 3.2, Eq. 1–3)
-
-With `d(·)` the L2 distance, `p^act` / `I^act` the *actual* foot position /
-contact:
-
-```
-reach  :  exp(-d(p^con_1, p^act)^2) · 1(I^con_1 = 0 ∧ s < ν)              (Eq. 1)
-hold   :  (1 + λ_hold · exp(-d(p^con_1, p^act)^2)) · 1(I^con_1 = I^act = 1) (Eq. 2)
-detach :  1(I^con_1 = I^act = 0 ∧ s > ν)                                  (Eq. 3)
-r^con  :  r^obj_pose + Σ_e (reach + hold + detach)
-```
-
-`r^obj_pose` is the manipulation-only object term and is omitted for locomotion.
-Each of reach / hold / detach is a separate, independently weighted mjlab reward
-term (see `contact_env_cfg.py`). In code, `exp(-d^2)` is generalised to
-`exp(-d^2 / std^2)`; `std = 1` reproduces the paper's literal form, and the
-default `std = 0.1` simply sharpens the spatial tolerance — set it to `1.0` for
-the exact expression.
-
-### Observations (Section 3.3)
-
-- **Actor** (paper-faithful): proprioception (joint positions, joint velocities,
-  last action) **+** task obs (current & next contact sequence of all feet;
-  current & next contact locations of all feet in the base frame; command
-  duration; relative distance of feet to their desired contacts). No height
-  scan; **no foot-contact sensing in the actor** ("did not make any difference
-  in simulation performance").
-- **Critic** (asymmetric / privileged): the actor obs **+** base linear &
-  angular velocity, projected gravity, and actual foot contact. This changes
-  nothing about the deployed policy's input contract.
-
-### Command sampling (Section 4, "Locomotion")
-
-Per the paper, the locomotion command distribution is **sampled once at
-initialisation** (it reports this yields a better policy than per-reset
-sampling): stride lengths `U(0.0, 0.3) m` and stance widths `U(0.1, 0.3) m` per
-front/hind pair; a heading `U[-π, π] rad` *or* (for curved paths) a yaw rate
-`U[-π, π] rad/s`; per-leg longitudinal + lateral offsets `U(-0.15, 0.15) m`;
-command durations `U[0.34, 0.36] s`. Extensive domain randomisation
-(friction, encoder bias, base-CoM offset, pushes) is applied on top.
-
-Goals **advance early with a bonus** when the base, projected to the ground,
-comes within a threshold of the current footholds — the paper's "update the
-goals … and provide a bonus reward for discovering more goals".
-
----
-
-## Project layout
-
-```
-src/contact_rl/
-  robots/go2.py                       Unitree Go2 EntityCfg + action scale
-  tasks/contact/
-    mdp/
-      contact_command.py              ContactGoalCommand (the contact goal)
-      rewards.py                      reach / hold / detach (Eq. 1–3) + penalties
-      observations.py                 feet→goal distance; privileged foot contact
-    contact_env_cfg.py                robot-agnostic task factory
-    config/go2/
-      env_cfgs.py                     Go2 flat env (train + play)
-      rl_cfg.py                       PPO runner cfg (recurrent GRU actor/critic)
-      runner.py                       ContactOnPolicyRunner (ONNX + entropy decay)
-      __init__.py                     register_mjlab_task(...)
-  scripts/{train,play}.py             entry points (register task, then delegate)
-src/assets/robots/unitree_go2/        Go2 MJCF + meshes
-paper.txt                             the paper (source text)
-```
-
-Task id: **`Mjlab-Contact-Flat-Unitree-Go2`**.
-
----
-
-## Setup
-
-This directory is a **uv workspace** whose root is `contact-rl` and whose only
-member is the vendored `mjlab` (`.mjlab_ref`). uv reads resolver-wide settings
-(`conflicts`, `environments`) and index definitions only from the workspace root,
-so mjlab's custom indexes (NVIDIA warp, PyTorch CUDA) are mirrored in
-`pyproject.toml`. Two upstream choices are deliberately *not* mirrored — the
-`mujoco-warp` git revision and mjlab's own torch extras; both are explained in
-comments in `pyproject.toml` and summarised below.
-
-A committed `uv.lock` (224 packages) pins the whole graph, so `uv sync` installs
-instead of re-resolving. Keep it with the tree when you copy the project
-anywhere.
+## Training
 
 ```bash
-# CUDA (Linux, recommended for training — matches the paper's setup):
-uv sync --extra cu128
+# Smoke run (Warp compiles kernels on the first run)
+uv run contact-train Mjlab-Contact-Flat-Unitree-Go2 --env.scene.num-envs 512 --agent.max-iterations 5
 
-# CPU-only (small smoke tests):
-uv sync --extra cpu
-```
-
-> mjlab targets Linux-x86_64 (CUDA) and macOS-arm64, and this workspace narrows
-> the resolution further to **Linux-x86_64 only** (the deployment target). On
-> other platforms `uv sync` reports that the current platform is not compatible
-> with the lockfile's supported environments; widen `[tool.uv] environments` if
-> you need one of them. Large-scale training needs an NVIDIA GPU.
-
-### Running on a Linux GPU server
-
-Two dependency-resolution details make the difference between "resolves in
-seconds" and "unsatisfiable"; both are already encoded in `pyproject.toml`, so
-the steps below are all you need — but do not undo them:
-
-* **`mujoco-warp` comes from PyPI (`==3.5.0.2`), not from mjlab's git rev.** uv
-  honours a *git* dependency's own `[tool.uv.sources]`, and `mujoco_warp` pins
-  `mujoco` to `py.mujoco.org`, which serves only `.dev` nightlies (oldest listed:
-  `3.10.1.dev939631378`). With the git rev in place, `mujoco>=3.5.0,<3.6` is
-  unsatisfiable, and a root-level `mujoco = { index = "pypi" }` pin does not
-  override it — uv fails with *conflicting indexes for package `mujoco`*. The
-  PyPI release is the same revision with identical requirements, as a
-  pure-python wheel, so the server needs neither `git` nor a source build.
-* **The `cu128` / `cpu` extras exist only on the workspace root.** They were
-  removed from `.mjlab_ref` (where they only re-added `torch>=2.7.0`, already a
-  base dependency). With extras on both packages uv splits the resolution 9 ways
-  and cross-splits such as `contact-rl[cu128] + mjlab[cpu]` activate both torch
-  indexes → *conflicting indexes for package `torch`*.
-
-`[tool.uv] environments` also narrows the resolution to `linux/x86_64`, which is
-why `uv sync` on Windows/macOS refuses the lockfile — that is expected.
-
-```bash
-# 0. Prerequisites: an NVIDIA driver new enough for CUDA 12.8 wheels
-#    (>= 525.60.13; >= 550 recommended) and ~25 GB free disk.
-nvidia-smi
-
-# 1. Install uv (brings its own Python; no system Python needed).
-curl -LsSf https://astral.sh/uv/install.sh | sh && . "$HOME/.local/bin/env"
-
-# 2. Install from the committed lockfile (--frozen = fail rather than silently
-#    re-resolve if uv.lock is missing or stale).
-uv sync --extra cu128 --python 3.12 --frozen
-
-# 3. Verify the GPU is actually visible to torch (a broken driver otherwise
-#    surfaces much later as an IndexError inside select_gpus).
-uv run python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
-
-# 4. Verify the task registered.
-uv run python -c "import contact_rl; from mjlab.tasks.registry import list_tasks; print(list_tasks())"
-
-# 5. Short smoke run (Warp compiles kernels on the first run: a few minutes).
-uv run contact-train Mjlab-Contact-Flat-Unitree-Go2 \
-    --env.scene.num-envs 512 --agent.max-iterations 5 --agent.logger tensorboard
-```
-
-Two things that bite on a headless box:
-
-* **The default logger is `wandb`**, so an un-authenticated server stalls or
-  errors on `wandb.init`. Either `wandb login` once, or export
-  `WANDB_MODE=offline`, or pass `--agent.logger tensorboard`.
-* **Long runs need `tmux`/`screen`** — the training process dies with the SSH
-  session otherwise.
-
-## Train
-
-```bash
+# Full run: paper default, 8192 envs
 uv run contact-train Mjlab-Contact-Flat-Unitree-Go2
-```
 
-`contact-train` registers this task into mjlab's registry and then hands off to
-mjlab's own training CLI, so **all** of mjlab's `train` flags work unchanged,
-e.g. limit parallel envs to fit your GPU:
-
-```bash
+# Lower-VRAM fallback
 uv run contact-train Mjlab-Contact-Flat-Unitree-Go2 --env.scene.num-envs 4096
+
+# Resume (full state, continues in a NEW run dir; the source is never modified)
+uv run contact-train Mjlab-Contact-Flat-Unitree-Go2 --resume-from runs/go2_contact/<run>:best
 ```
 
-## Play / visualise a checkpoint
+All mjlab `TrainConfig` flags work (`--env.*`, `--agent.*`, `--video`,
+`--gpu-ids`, `--enable-nan-guard True` -> `env.sim.nan_guard.enabled`), plus
+`--resume-from`, `--device`, `--run-root`, `--keep-last`, `--keep-every`,
+`--keep-best`, `--export-onnx`. First Ctrl-C / SIGTERM: finish the iteration,
+save a checkpoint, exit. A duplicate SIGINT within 1 s (e.g. from `uv run`) is
+ignored; a later Ctrl-C aborts hard (exit 130). A Ctrl-C / SIGTERM *before*
+training has started (e.g. while the env is being built and Warp compiles its
+kernels) is a clean stop too: exit 0, `run_info.json` finalised as
+`status: "stopped"` (no checkpoint yet), further signals during that stop are
+ignored.
+
+## Continuing training from a finished checkpoint
+
+A run that reached `max_iterations` (`status: "finished"`) is resumed exactly
+like a stopped one. Example: the committed 2000-iteration checkpoint
+(`model_1999.pt` = iterations 0..1999), 3000 more iterations up to 5000:
 
 ```bash
-uv run contact-play Mjlab-Contact-Flat-Unitree-Go2 --wandb-run-path <entity/project/run>
+uv run contact-train Mjlab-Contact-Flat-Unitree-Go2 \
+  --resume-from runs/go2_contact/2026-10-01_04-21-51/checkpoints/model_1999.pt \
+  --agent.max-iterations 3000
+# equivalent selector: runs/go2_contact/2026-10-01_04-21-51:1999
 ```
 
----
+- `--agent.max-iterations` is the number of **additional** iterations
+  (`start .. start + N - 1`, printed at startup), not the final iteration.
+- Restored from the checkpoint: actor + critic weights (including the GRUs),
+  optimizer state and the iteration counter (training continues at
+  `iter + 1`). The entropy schedule uses the absolute iteration, so it simply
+  continues (0.0064 at iteration 2000, 0.001 from 5000).
+- **Not** restored: the env config. It is rebuilt from the current code and the
+  CLI flags, so reward / termination / domain-randomisation edits made after
+  the checkpoint take effect on resume.
+- Output goes to a **new** run dir; the source checkpoint is never written.
+  `best.pt` of the new run is ranked by the *new* reward, which is not
+  comparable with the old run's numbers.
+- If the checkpoint came from git, it must be the real file, not a Git LFS
+  pointer (`ls -lh` should show MBs, not ~130 bytes; `git lfs pull` if needed).
 
-## Training setup
+What may change between the checkpoint and the resumed run:
 
-- **Recurrent (GRU) actor & critic.** The policy is recurrent, as in the paper.
-  On the pinned stack this uses rsl-rl's unified `class_name="RNNModel"`
-  (`rsl_rl/models/rnn_model.py`, which inherits `MLPModel` and adds
-  `rnn_type`/`rnn_hidden_dim`/`rnn_num_layers`). mjlab forwards the runner cfg to
-  rsl-rl via `dataclasses.asdict` without dropping unknown keys, so the
-  `RslRlRnnModelCfg` subclass in `rl_cfg.py` flows straight through; PPO
-  auto-detects recurrence and manages hidden states / BPTT itself. Defaults:
-  GRU, `rnn_hidden_dim=256`, `rnn_num_layers=1`, MLP head `(512, 256, 128)`.
-- **Entropy decay.** The paper anneals the entropy coefficient. rsl-rl's
-  `PPO.entropy_coef` is a plain mutable float with no built-in schedule, so
-  `ContactOnPolicyRunner` applies a **linear decay** by chunking `learn()` and
-  re-setting `alg.entropy_coef` between chunks. Tune via the module constants in
-  `runner.py`.
+| Change | OK? | Note |
+| --- | --- | --- |
+| reward terms / weights | yes | expect a value-loss spike and a reward dip for ~100-200 iterations while the critic re-fits |
+| terminations, events, pushes, friction ranges | yes | add a new hard termination gradually (a penalty first), or many episodes end at once |
+| sensors that are not observations (e.g. `illegal_contact`) | yes | |
+| `--env.scene.num-envs` | yes | see below |
+| PPO hyper-parameters (`--agent.algorithm.*`) | yes | |
+| actor / critic observations | **no** | input size changes, `strict=True` load fails |
+| action space, network sizes, GRU size | **no** | same reason |
+| default task <-> `-Improved` task | **no** | different observations (IMU + normalisation) |
 
-## Minor configuration notes
+**Different `num_envs` (e.g. 12000 -> 20000):** fine. The network does not
+depend on the number of envs, and each env's command (gait, strides, stance,
+heading / yaw rate) is sampled once when the env is built, so a larger count
+just covers more of the command space. A PPO iteration then collects
+`24 x num_envs` transitions and the 4 mini-batches get larger; the adaptive LR
+handles that. The real limits are VRAM and throughput: check first with
+`uv run contact-bench --num-envs 12000 16000 20000`, and if `env-steps/s` no
+longer grows, more envs only make each iteration slower.
 
-- Default `num_envs = 4096` (paper uses 8192); raise/lower via
-  `--env.scene.num-envs` as GPU memory allows.
+If the old policy is stuck in a bad local optimum (e.g. kneeling) and the new
+penalty does not remove it within a few hundred iterations, train from scratch
+instead: by iteration 2000 the action noise has already shrunk, which makes
+escaping it slow.
 
-## Design choices where the paper is underspecified
+## Evaluation
 
-The paper specifies the *contents* of a contact goal and the command sampling,
-but not the exact **foothold propagation**. This implementation (documented in
-`contact_command.py`):
+```bash
+uv run contact-eval --task Mjlab-Contact-Flat-Unitree-Go2 --checkpoint <selector|model.pt>
+uv run contact-eval --help        # all options (--run-dir, --video, --out-dir ...)
+```
 
-- lays footholds out in a **travel frame** whose yaw is the desired
-  travel/facing direction and which integrates the yaw rate for curved paths;
-- marches a foot's world foothold forward by its pair's stride each time it
-  *lifts off* (contact sequence 1 → 0), so the very first goal a swinging foot
-  sees is already one stride ahead of where it departed; goals are
-  piecewise-constant within a switch so the target is stable;
-- re-anchors footholds to a nominal stance at each reset;
-- advances goals early on discovery (see above).
+Per gait x command duration, 15 s episodes. Fig. 6 metrics
+(`contact_plan_hamming`, `contact_location_error`) are step-weighted averages;
+per-episode means are also stored in `summary.json` next to the CSV.
 
-The gait contact patterns (`_GAIT_PATTERNS` in `contact_command.py`), the
-phase threshold `ν = 0.18`, the reward `std`, and all reward weights are
-explicit, documented constants intended for tuning.
+## Watcher
 
-## Future work
+```bash
+uv run contact-watch --run latest   # or --run runs/go2_contact/<run> --interval-s 60 --num-envs 128
+```
 
-- Manipulation / humanoid tasks (the object-pose term `r^obj_pose` and the
-  contact goals for a humanoid's end-effectors), building on the same
-  `ContactGoalCommand` and reach/hold/detach rewards.
+Polls a run for new, settled, valid checkpoints and evaluates each once in an
+isolated `contact-eval` subprocess (own process group, `--timeout-s`). The
+evaluated file is a hard-linked snapshot, so retention cannot delete it
+mid-evaluation; `summary.json` / `evaluations.csv` record the original
+checkpoint path (`--source-checkpoint`). If the snapshot cannot be taken, or no
+longer validates once taken (retention replaced the source after it was
+queued), the checkpoint is retried on the next poll rather than evaluated in
+place, and the `--max-retries` budget is not consumed. Stale `summary.json`
+files are removed before each attempt. `metrics/watch.lock` (flock) makes a
+second watcher on the same run exit with code 3; checkpoints deleted by
+retention are skipped.
+Results: `metrics/iteration_<it>/`, `videos/iteration_<it>/`, `metrics/watch_state.json`.
+
+## Play
+
+```bash
+uv run contact-play Mjlab-Contact-Flat-Unitree-Go2 --checkpoint best
+uv run contact-play Mjlab-Contact-Flat-Unitree-Go2 --checkpoint-file model.pt
+```
+
+GRU hidden state is reset at episode boundaries (Viser and native viewer). The
+Viser viewer binds to `127.0.0.1:8080`; a non-loopback `--host` is refused
+unless `--allow-public True` is given, and then a prominent security warning is
+printed (the viewer has no authentication, prefer an SSH tunnel).
+
+## Diagnostics
+
+`uv run contact-doctor` checks Python, torch/CUDA, MuJoCo/EGL, mjlab and task
+registration.
+
+## Benchmark
+
+`uv run contact-bench --num-envs 2048 4096 8192` reports hardware and env
+throughput to help pick `num_envs`.
+
+## Checkpoints
+
+```
+runs/<experiment>/<timestamp>[_name]/      # e.g. runs/go2_contact/2026-01-31_12-00-00
+  run_info.json                            # status: starting|running|finished|stopped|aborted|failed
+  checkpoints/model_<iter>.pt              # atomic writes (.tmp + rename)
+  checkpoints/latest.pt                    # symlink (copy if symlinks fail) to the newest model_<iter>.pt
+  checkpoints/best.pt                      # copy of the best checkpoint (mean episode reward)
+  checkpoints/index.json                   # every saved iteration + best
+  config/  logs/train.log  logs/error.txt (on crash)  exported/policy.onnx  metrics/  videos/
+```
+
+Retention keeps the newest `--keep-last` (5), multiples of `--keep-every`
+(1000) and the best iteration. Selectors (`--checkpoint`, `--resume-from`):
+a `.pt` file, a run dir (= its latest), `<run_dir>:<iter>|best|latest`, or
+`latest` / `best` (newest run under `runs/`). Corrupt or
+half-written files are skipped by `latest`. mjlab's legacy
+`logs/rsl_rl/<experiment>/<run>/model_<iter>.pt` layout is only produced by a
+multi-GPU run (see below) and is still readable (`--checkpoint-file`,
+`--agent.resume True`). `runs/` and `logs/` are git-ignored.
+
+## Video
+
+`contact-train --video` streams training clips to `videos/train/iteration_<it>/`;
+`contact-watch` records evaluation videos to `videos/iteration_<it>/`;
+`contact-play --video` writes to `<run>/videos/play/`. Rendering is headless
+via EGL on servers. `*.mp4` is git-ignored.
+
+## GRU / ONNX
+
+rsl-rl-lib 5.0.1's GRU export path returns `(actions, h, None)` while declaring
+two outputs. `utils/onnx_compat.py` wraps the export module (`DropNoneOutputs`)
+so `None` outputs are dropped, output order is preserved and a real
+output-count mismatch raises. Non-recurrent / LSTM policies pass through
+unchanged. The file is written atomically (`.tmp` + rename).
+
+## Logging
+
+The project default is **TensorBoard** (`rl_cfg.py`: `logger="tensorboard"`);
+mjlab's own default (W&B) is overridden because it blocks on a headless VPS.
+Opt in with `--agent.logger wandb` (project `contact-rl`).
+
+```bash
+uv run tensorboard --logdir runs --host 127.0.0.1 --port 6006
+```
+
+## GPU / environment count
+
+- **8192** envs = paper / project default (`PAPER_NUM_ENVS` in `env_cfgs.py`).
+- **4096** = lower-VRAM fallback; pass `--env.scene.num-envs 4096` explicitly.
+- `--gpu-ids` takes a quoted Python list (mjlab's tyro config uses
+  `UsePythonSyntaxForLiteralCollections`): `--gpu-ids "[0]"` (default),
+  `--gpu-ids "[1]"`, `--gpu-ids "[0, 1]"`, or `--gpu-ids all`. `--gpu-ids 0 1`
+  is **not** valid. The ids index into `CUDA_VISIBLE_DEVICES`; alternatively
+  `CUDA_VISIBLE_DEVICES=1` or `--device cuda:1`.
+- One selected GPU (including `all` on a one-GPU machine) trains in-process
+  with full run management. Only when more than one GPU is actually selected
+  is training delegated to mjlab's multi-GPU launcher (legacy `logs/rsl_rl`
+  layout, no run management; contact-train-only flags are ignored with a
+  warning).
+
+## VPS
+
+See [`docs/VPS_DEPLOYMENT.md`](docs/VPS_DEPLOYMENT.md) and
+[`scripts/vps/README.md`](scripts/vps/README.md): tmux wrappers that report the
+command's real exit code, graceful `stop.sh`, TensorBoard, SSH tunnel and
+optional systemd user units (which use the 8192 default).
+
+## Testing
+
+```bash
+UV_NO_SYNC=1 uv run --with pytest pytest tests -q   # after the env was synced once
+```
+
+- **Lightweight / local** (no GPU): planner math, checkpoint lifecycle, episode
+  metrics, watcher logic, CLI helpers, VPS script syntax / tmux exit codes,
+  systemd and `.gitignore` static checks (`tests/test_vps_scripts.py`), and
+  the second-pass regressions (`tests/test_second_pass_regressions.py`: VPS
+  scripts against fake `uv` / `tmux`, `UV_NO_SYNC` propagation, systemd unit
+  settings, `contact-train` startup stop against stubbed torch / mjlab,
+  atomic JSON, duplicate Ctrl-C, run lock, ONNX temp cleanup).
+- **Linux/VPS-only**: anything importing mjlab / MuJoCo-Warp (the lock is
+  Linux x86_64 only), EGL rendering, `contact-doctor` end to end.
+- **GPU-dependent**: training, `contact-bench`, full `contact-eval` runs.
+
+## Why many parallel environments (and why `contact-play` shows 64 robots)
+
+`contact-play` and `contact-eval` load the task's **play** config
+(`env_cfgs.py`, `play=True`), which uses **64** envs, no pushes, no observation
+noise and practically endless episodes. Nothing is being trained there: the
+robots only run the loaded checkpoint. Use `--num-envs 1` to see a single robot:
+
+```bash
+uv run contact-play Mjlab-Contact-Flat-Unitree-Go2 --checkpoint best --num-envs 1
+```
+
+Training (`contact-train`) uses **8192** envs by default. What the env count
+does and does not change:
+
+- **Iteration time barely changes, sample throughput does.** MuJoCo-Warp steps
+  all envs in one batched GPU kernel. Until the GPU is saturated, stepping 8192
+  envs takes about as long as stepping 512, so seconds per iteration look
+  "the same". But one PPO iteration collects `24 x num_envs` transitions
+  (512 envs: 12,288; 8192 envs: 196,608), i.e. 16x more experience in the same
+  wall-clock time. Compare the `fps` value printed per iteration (and
+  `training/fps` in TensorBoard), not the iteration time.
+- **Better gradients.** PPO splits each iteration into 4 mini-batches; with more
+  envs they are larger and less noisy, so learning per iteration is more stable.
+- **Command coverage (specific to this task).** Each env samples its gait,
+  front/hind stride, stance width, leg offsets and heading *or* yaw rate
+  **once**, when the env is built (paper Sec. 4). With 8192 envs every one of the
+  5 gaits gets ~1600 different command combinations; with 512 envs only ~100.
+  Fewer envs means the policy sees a thinner slice of the command space and
+  generalises worse, even when the iteration speed looks identical.
+- **Past the knee it stops helping.** Once the GPU is saturated, iteration time
+  grows roughly linearly with `num_envs` and throughput stops improving (or VRAM
+  runs out). Find the knee with
+  `uv run contact-bench --num-envs 1024 2048 4096 8192` and pick the largest size
+  whose `env-steps/s` still grows clearly.
+
+If you change `num_envs`, the number of iterations needed to converge changes
+too: with fewer envs you need more iterations for the same amount of experience.
+
+## How long training takes and when it ends
+
+- A run ends after `max_iterations` = **10,000** PPO iterations (`rl_cfg.py`),
+  i.e. iterations `start .. start + 9999` (printed at startup). At the end the log
+  prints `[contact-train] finished.` and `run_info.json` gets
+  `"status": "finished"`, `"exit_code": 0`.
+- Total time = `10,000 x (seconds per iteration)`. Every iteration prints a line
+  like `[iter 1234] reward=... t=1.80s fps=...`; multiply `t` by the remaining
+  iterations. Examples: 1 s/iter ~= 2.8 h, 2 s/iter ~= 5.6 h, 4 s/iter ~= 11 h.
+  The first iterations are slower (Warp kernel compilation / CUDA graph capture).
+  The same number is in TensorBoard as `training/iteration_time`.
+- Check progress at any time:
+
+```bash
+tail -f runs/go2_contact/<run>/logs/train.log      # per-iteration line
+cat runs/go2_contact/<run>/run_info.json           # status, last_iteration
+cat runs/go2_contact/<run>/checkpoints/index.json  # saved iterations + best
+```
+
+- A checkpoint is written every 50 iterations (`save_interval`), so you can stop
+  early at any time (Ctrl-C once, or `bash scripts/vps/stop.sh train`): the
+  current iteration finishes, a checkpoint is saved and `best.pt` stays usable.
+  The entropy coefficient decays until iteration 5000; if `training/reward` and
+  the evaluation metrics have plateaued well after that, stopping early is fine.
+- Shorter run: `--agent.max-iterations 3000`. Continue a stopped run:
+  `--resume-from runs/go2_contact/<run>:latest` (continues in a new run dir).
+
+## Pushing the trained weights to GitHub
+
+`runs/`, `*.pt` and `*.onnx` are git-ignored on purpose (checkpoints are written
+every 50 iterations). Publish only the final artefacts. `latest.pt` may be a
+symlink, so copy with `cp -L`.
+
+Option A: commit them into the repo (the Go2 GRU checkpoint is a few MB, well
+below GitHub's 100 MB per-file limit):
+
+```bash
+RUN=runs/go2_contact/<run>                       # the finished run dir
+mkdir -p weights/go2_contact
+cp -L $RUN/checkpoints/best.pt       weights/go2_contact/best.pt
+cp -L $RUN/exported/policy.onnx      weights/go2_contact/policy.onnx
+cp    $RUN/run_info.json $RUN/checkpoints/index.json weights/go2_contact/
+cp -r $RUN/config                    weights/go2_contact/config
+git add -f weights/go2_contact                   # -f: bypasses the *.pt / *.onnx ignore rules
+git commit -m "weights: go2_contact <run> best checkpoint + ONNX"
+git push origin audit/paper-alignment
+```
+
+After cloning, play it directly: `uv run contact-play Mjlab-Contact-Flat-Unitree-Go2 --checkpoint weights/go2_contact/best.pt`.
+
+Option B: attach them to a GitHub Release (keeps the git history small,
+recommended if you publish many runs), with the GitHub CLI:
+
+```bash
+gh release create go2-contact-v1 weights/go2_contact/best.pt weights/go2_contact/policy.onnx \
+  --title "Go2 contact policy v1" --notes "run <run>, iteration <it>"
+```
+
+For files above 100 MB use Git LFS (`git lfs track "*.pt"`) or a Release.
+
+## Commanding the robot after training
+
+**In simulation (Viser viewer).** Start the viewer on the server, open an SSH
+tunnel from your laptop, then open `http://localhost:8080`:
+
+```bash
+uv run contact-play Mjlab-Contact-Flat-Unitree-Go2 --checkpoint best --num-envs 1   # on the server
+ssh -N -L 8080:127.0.0.1:8080 <user>@<vps>                                          # on your laptop
+```
+
+The **Contact control** panel steers the policy through the same planner that
+generated the training goals:
+
+- **Gait**: `(as trained)`, trot, pace, bound, jump, crawl.
+- **Direction (deg)**: travel direction relative to the body (0 forward, 90
+  left, 180 backwards).
+- **Speed (m/s)**: converted to a stride (`stride = speed x period x S`). Speed
+  0 = step in place.
+- **Turning (rad/s)**: yaw rate. Training samples a direction *or* a turning
+  rate, never both, so combining them is out of distribution.
+- **Apply to all envs** (or only the selected env), **Apply command**,
+  **Restore trained commands**, **Restart episode (reset GRU)**.
+- **Checkpoint** panel: switch between saved checkpoints of the run without
+  restarting.
+
+Trained range: stride 0 to 0.3 m, i.e. about **0.43 m/s** max for trot / pace /
+bound / jump and about **0.21 m/s** for crawl, and turning up to pi rad/s.
+Larger values are applied but flagged as OUT OF TRAINING DISTRIBUTION in the
+panel (nothing is clamped).
+
+**From Python** (same pathway, e.g. for scripted tests):
+
+```python
+import math
+from contact_rl.tasks.contact.mdp.command_override import UserCommand, apply_to_command_term
+
+term = env.unwrapped.command_manager.get_term("contact")
+warnings = apply_to_command_term(term, UserCommand(gait="trot", speed=0.3, heading_offset=0.0, yaw_rate=0.0))
+# walk left: heading_offset=math.pi / 2 ; turn on the spot: speed=0.0, yaw_rate=1.0
+```
+
+**On the real Go2.** This repo contains no hardware deployment code. The
+exported `exported/policy.onnx` is the actor only (GRU hidden state is an extra
+input / output that must be carried between steps and zeroed on reset). A
+deployment has to rebuild the actor observation at 50 Hz exactly as in training
+(joint positions relative to default, joint velocities, last action, the 33-dim
+contact goal from `GaitPlanner` in the yaw-aligned base frame, feet-to-goal
+vectors from forward kinematics) and send the 12 outputs, scaled by
+`GO2_ACTION_SCALE` and added to the default joint positions, as PD position
+targets. Validate in simulation first.
