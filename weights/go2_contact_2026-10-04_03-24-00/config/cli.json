@@ -1,0 +1,11 @@
+{
+  "argv": [
+    "/root/rl/.venv/bin/contact-train",
+    "Mjlab-Contact-Flat-Unitree-Go2",
+    "--resume-from",
+    "runs/go2_contact/2026-10-04_02-51-44/checkpoints/model_499.pt",
+    "--agent.max-iterations",
+    "2000"
+  ],
+  "task": "Mjlab-Contact-Flat-Unitree-Go2"
+}
