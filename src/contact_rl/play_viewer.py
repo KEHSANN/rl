@@ -16,6 +16,10 @@ reset, speed, env selection, plots) with:
 * **Restart episode**: resets all envs and the GRU hidden state.
 * **GRU reset on termination**: after every step the hidden state of envs
   whose episode ended is zeroed (mjlab's viewer never does this).
+* **Liquid AI (optional)**: only when a ``liquid`` runtime is passed
+  (``contact-play --liquid True``): a text box whose instructions are turned
+  into validated planner commands by :mod:`contact_rl.runtime`. Without it the
+  viewer is unchanged.
 
 All GUI callbacks only enqueue actions; they are executed on the simulation
 thread by ``BaseViewer._process_actions``.
@@ -58,6 +62,7 @@ class ContactPlayViewer(ViserPlayViewer):
     load_policy: Callable[[Path], Any] | None = None,
     checkpoints: Callable[[], list[Path]] | None = None,
     current_checkpoint: Path | None = None,
+    liquid=None,
     **kw,
   ):
     super().__init__(env, policy, viser_server=viser_server, **kw)
@@ -69,6 +74,7 @@ class ContactPlayViewer(ViserPlayViewer):
     self._episode_ends = 0
     self._gru_resets = 0
     self._msg = ""
+    self._liquid = liquid  # contact_rl.runtime.viewer_bridge.LiquidRuntime | None
 
   # ---------------------------------------------------------------- GUI
 
@@ -129,6 +135,32 @@ class ContactPlayViewer(ViserPlayViewer):
       def _(_) -> None:
         self._ckpt_dd.options = self._refresh_ckpts()
 
+    if self._liquid is not None:
+      self._setup_liquid(gui)
+
+  def _setup_liquid(self, gui) -> None:
+    with gui.add_folder("Liquid AI"):
+      self._liq_html = gui.add_html("")
+      self._liq_text = gui.add_text("Instruction", initial_value="walk forward slowly")
+      b_send = gui.add_button("Send to Liquid AI")
+      b_stop = gui.add_button("STOP (no model)")
+
+      @b_send.on_click
+      def _(_) -> None:
+        self._liquid.send_text(self._liq_text.value)
+
+      @b_stop.on_click
+      def _(_) -> None:
+        self._liquid.send_stop()
+
+    self._liquid.attach(self.request_action, self._term, self._ids, lambda: int(self._scene.env_idx))
+    self._liquid.start()  # loads the model on the worker thread; the sim keeps running
+
+  def close(self) -> None:
+    if self._liquid is not None:
+      self._liquid.stop()
+    super().close()
+
   # -------------------------------------------------------------- actions
 
   def _ids(self) -> torch.Tensor | None:
@@ -142,7 +174,9 @@ class ContactPlayViewer(ViserPlayViewer):
     kind, arg = payload
     try:
       with self._sim_lock:
-        if kind == "apply":
+        if self._liquid is not None and isinstance(kind, str) and kind.startswith("liquid_"):
+          self._msg = "liquid: " + self._liquid.handle(kind, arg)
+        elif kind == "apply":
           cmd = build_user_command(self._gait.value, self._heading.value, self._speed.value, self._yaw.value)
           self._warnings = apply_to_command_term(self._term(), cmd, self._ids())
           self._msg = "command applied" + (" (OUT OF TRAINING DISTRIBUTION)" if self._warnings else "")
@@ -210,5 +244,10 @@ class ContactPlayViewer(ViserPlayViewer):
           <strong>Episode ends:</strong> {self._episode_ends} | <strong>GRU resets:</strong> {self._gru_resets}<br/>
           {html.escape(self._msg)}{warn}
         </div>"""
+      if self._liquid is not None and hasattr(self, "_liq_html"):
+        self._liq_html.content = (
+          '<div style="font-size:0.85em;line-height:1.3;padding:0 1em 0.5em 1em;">'
+          f"{html.escape(self._liquid.status_line())}<br/>{html.escape(self._liquid.last_msg)}</div>"
+        )
     except Exception:
       pass
