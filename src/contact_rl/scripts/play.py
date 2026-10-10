@@ -13,6 +13,11 @@ Examples::
   uv run contact-play Mjlab-Contact-Flat-Unitree-Go2 --checkpoint runs/go2_contact/<run>:1500
   uv run contact-play Mjlab-Contact-Flat-Unitree-Go2 --checkpoint-file model.pt   # mjlab flag, still works
 
+Optional Liquid AI high-level decisions (runtime only, see docs/liquid_runtime.md)::
+
+  uv run --with "transformers>=5.19" --with "torchao>=0.18" --with pillow \\
+    contact-play Mjlab-Contact-Flat-Unitree-Go2 --checkpoint best --liquid True --liquid-stdin True
+
 All mjlab ``play`` flags are accepted (``--agent``, ``--checkpoint-file``,
 ``--wandb-run-path``, ``--num-envs``, ``--device``, ``--video``, ``--viewer``,
 ``--no-terminations`` ...). See :mod:`contact_rl.play_viewer` for the controls.
@@ -46,9 +51,23 @@ contact-play-only options (all mjlab play flags also work: --agent,
   --port PORT          viewer port                        (default: 8080)
   --allow-public BOOL  required to bind a non-loopback host (no authentication!)
 
+optional Liquid AI runtime (Viser viewer only; off by default):
+  --liquid BOOL                  enable LiquidAI high-level decisions   (default: False)
+  --liquid-model ID              HF model id        (default: LiquidAI/d1-3B-w8a8)
+  --liquid-device DEV            model device       (default: cuda)
+  --liquid-stdin BOOL            also read instructions from this terminal
+  --liquid-timeout-s S           discard decisions slower than this      (default: 5.0)
+  --liquid-speed-fraction F      speed cap, fraction of trained max (0,1] (default: 0.8)
+  --liquid-yaw-rate W            |yaw rate| used for "turn"  (rad/s)    (default: 0.5)
+  --liquid-yaw-max W             yaw-rate cap, <= pi (rad/s)            (default: 1.0)
+  --liquid-max-speed-step V      max speed change per decision (m/s)    (default: 0.1)
+  --liquid-max-yaw-step W        max yaw-rate change per decision       (default: 0.5)
+  --liquid-gaits G [G ...]       gaits the model may select             (default: all 5)
+
 examples:
   contact-play Mjlab-Contact-Flat-Unitree-Go2 --checkpoint best
   contact-play Mjlab-Contact-Flat-Unitree-Go2 --checkpoint runs/go2_contact/<run>:1500
+  contact-play Mjlab-Contact-Flat-Unitree-Go2 --checkpoint best --liquid True --liquid-stdin True
   ssh -N -L 8080:127.0.0.1:8080 <user>@<vps>    # then open http://localhost:8080"""
 
 
@@ -64,8 +83,40 @@ def _config_cls():
     port: int = 8080
     allow_public: bool = False
     """Required to bind a non-loopback host (the viewer has no authentication)."""
+    liquid: bool = False
+    """Enable the optional LiquidAI high-level decision layer (runtime only)."""
+    liquid_model: str = "LiquidAI/d1-3B-w8a8"
+    liquid_device: str = "cuda"
+    liquid_compile: bool = True
+    liquid_stdin: bool = False
+    """Also read natural-language instructions from stdin ('stop' = immediate stop)."""
+    liquid_timeout_s: float = 5.0
+    liquid_speed_fraction: float = 0.8
+    """Speed cap as a fraction of the per-gait trained max (provisional; <= 1)."""
+    liquid_yaw_rate: float = 0.5
+    liquid_yaw_max: float = 1.0
+    liquid_max_speed_step: float = 0.1
+    liquid_max_yaw_step: float = 0.5
+    liquid_gaits: tuple[str, ...] = ("trot", "pace", "bound", "jump", "crawl")
 
   return ContactPlayConfig
+
+
+def build_liquid_runtime(cfg):
+  """``None`` unless ``--liquid True``. Validates the caps before anything loads."""
+  if not getattr(cfg, "liquid", False):
+    return None
+  from contact_rl.runtime.decision_schema import Limits
+  from contact_rl.runtime.viewer_bridge import build_runtime
+
+  try:
+    limits = Limits(speed_fraction=cfg.liquid_speed_fraction, yaw_rate_max=cfg.liquid_yaw_max,
+                    max_speed_step=cfg.liquid_max_speed_step, max_yaw_step=cfg.liquid_max_yaw_step,
+                    gaits=tuple(cfg.liquid_gaits))
+    return build_runtime(model_id=cfg.liquid_model, device=cfg.liquid_device, compile=cfg.liquid_compile,
+                         limits=limits, yaw_rate=cfg.liquid_yaw_rate, timeout_s=cfg.liquid_timeout_s)
+  except ValueError as e:
+    raise SystemExit(f"[play] invalid Liquid AI option: {e}") from e
 
 
 def check_port(host: str, port: int) -> None:
@@ -121,6 +172,9 @@ def run(task_id: str, cfg) -> None:
     print("[play] authentication: anyone who can reach this port can control the", file=sys.stderr)
     print("[play] simulation. Prefer 127.0.0.1 + an SSH tunnel.", file=sys.stderr)
     print("!" * 70, file=sys.stderr, flush=True)
+  liquid = build_liquid_runtime(cfg)
+  if liquid is not None and cfg.viewer == "native":
+    raise SystemExit("[play] --liquid requires the Viser viewer (--viewer viser or auto on a headless host).")
   configure_torch_backends()
   device = rt.resolve_device(cfg.device)
   rt.set_egl_device_for(device)
@@ -194,6 +248,8 @@ def run(task_id: str, cfg) -> None:
     viewer = cfg.viewer
     if viewer == "auto":
       viewer = "native" if rt.has_display() else "viser"
+    if liquid is not None and viewer == "native":
+      raise SystemExit("[play] --liquid requires the Viser viewer; pass --viewer viser.")
     if viewer == "native":
       from mjlab.viewer import NativeMujocoViewer
 
@@ -210,11 +266,18 @@ def run(task_id: str, cfg) -> None:
       print(f"[play] Viser listening on {where}" + ("" if rt.is_loopback(cfg.host) else "  (PUBLIC, no auth!)"))
       print(f"[play] from your laptop:  ssh -N -L {cfg.port}:127.0.0.1:{cfg.port} <user>@<vps>")
       print(f"[play] then open          http://localhost:{cfg.port}")
+      if liquid is not None:
+        print(f"[play] Liquid AI: {cfg.liquid_model} loads in the background; see the 'Liquid AI' panel.")
       print("=" * 70, flush=True)
       try:
-        ContactPlayViewer(venv, policy, viser_server=server, load_policy=load_policy if trained else None,
-                          checkpoints=list_ckpts, current_checkpoint=ckpt).run()
+        v = ContactPlayViewer(venv, policy, viser_server=server, load_policy=load_policy if trained else None,
+                              checkpoints=list_ckpts, current_checkpoint=ckpt, liquid=liquid)
+        if liquid is not None:
+          liquid.use_stdin = cfg.liquid_stdin  # reader starts after the viewer is attached
+        v.run()
       finally:
+        if liquid is not None:
+          liquid.stop()
         server.stop()
   finally:
     try:
