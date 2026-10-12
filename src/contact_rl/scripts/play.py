@@ -16,7 +16,8 @@ Examples::
 Optional Liquid AI high-level decisions (runtime only, see docs/liquid_runtime.md)::
 
   uv run --with "transformers>=5.19" --with "torchao>=0.18" --with pillow \\
-    contact-play Mjlab-Contact-Flat-Unitree-Go2 --checkpoint best --liquid True --liquid-stdin True
+    contact-play Mjlab-Contact-Flat-Unitree-Go2 --checkpoint best --num-envs 1 --liquid True \\
+    --liquid-mode closed_loop --liquid-decision-hz 1.0 --liquid-target 2.0 0.0 --liquid-stdin True
 
 All mjlab ``play`` flags are accepted (``--agent``, ``--checkpoint-file``,
 ``--wandb-run-path``, ``--num-envs``, ``--device``, ``--video``, ``--viewer``,
@@ -63,6 +64,14 @@ optional Liquid AI runtime (Viser viewer only; off by default):
   --liquid-max-speed-step V      max speed change per decision (m/s)    (default: 0.1)
   --liquid-max-yaw-step W        max yaw-rate change per decision       (default: 0.5)
   --liquid-gaits G [G ...]       gaits the model may select             (default: all 5)
+  --liquid-mode M                closed_loop (persistent mission, periodic decisions from
+                                 robot feedback) | oneshot (one inference per instruction)
+                                                                        (default: closed_loop)
+  --liquid-decision-hz F         closed loop: max model decisions per sim second; the period is
+                                 also >= 2 x measured median latency    (default: 1.0)
+  --liquid-decision-deadline-s S closed loop: per-decision deadline     (default: 2.0)
+  --liquid-target FWD LEFT       closed loop: target (m) relative to the robot at mission start
+  --liquid-autostart BOOL        closed loop: start missions as soon as interpreted (default: True)
 
 examples:
   contact-play Mjlab-Contact-Flat-Unitree-Go2 --checkpoint best
@@ -98,6 +107,14 @@ def _config_cls():
     liquid_max_speed_step: float = 0.1
     liquid_max_yaw_step: float = 0.5
     liquid_gaits: tuple[str, ...] = ("trot", "pace", "bound", "jump", "crawl")
+    liquid_mode: str = "closed_loop"
+    """closed_loop: persistent mission + periodic model decisions from robot feedback; oneshot: one per instruction."""
+    liquid_decision_hz: float = 1.0
+    """Closed loop: upper bound on model decisions per sim second (also >= 2 x median latency)."""
+    liquid_decision_deadline_s: float = 2.0
+    liquid_target: tuple[float, float] | None = None
+    """Closed loop: (forward, left) target in metres relative to the robot pose at mission start."""
+    liquid_autostart: bool = True
 
   return ContactPlayConfig
 
@@ -106,15 +123,25 @@ def build_liquid_runtime(cfg):
   """``None`` unless ``--liquid True``. Validates the caps before anything loads."""
   if not getattr(cfg, "liquid", False):
     return None
-  from contact_rl.runtime.decision_schema import Limits
+  from contact_rl.runtime.decision_schema import ClosedLoopConfig, Limits
   from contact_rl.runtime.viewer_bridge import build_runtime
 
   try:
     limits = Limits(speed_fraction=cfg.liquid_speed_fraction, yaw_rate_max=cfg.liquid_yaw_max,
                     max_speed_step=cfg.liquid_max_speed_step, max_yaw_step=cfg.liquid_max_yaw_step,
                     gaits=tuple(cfg.liquid_gaits))
-    return build_runtime(model_id=cfg.liquid_model, device=cfg.liquid_device, compile=cfg.liquid_compile,
-                         limits=limits, yaw_rate=cfg.liquid_yaw_rate, timeout_s=cfg.liquid_timeout_s)
+    mode = getattr(cfg, "liquid_mode", "closed_loop")
+    cl = ClosedLoopConfig(decision_hz=getattr(cfg, "liquid_decision_hz", 1.0),
+                          deadline_s=getattr(cfg, "liquid_decision_deadline_s", 2.0))
+    rt = build_runtime(model_id=cfg.liquid_model, device=cfg.liquid_device, compile=cfg.liquid_compile,
+                       limits=limits, yaw_rate=cfg.liquid_yaw_rate, timeout_s=cfg.liquid_timeout_s, mode=mode,
+                       closed_loop=cl, autostart=getattr(cfg, "liquid_autostart", True))
+    target = getattr(cfg, "liquid_target", None)
+    if target is not None:
+      if mode != "closed_loop":
+        raise ValueError("--liquid-target needs --liquid-mode closed_loop")
+      rt.on_target(tuple(target))
+    return rt
   except ValueError as e:
     raise SystemExit(f"[play] invalid Liquid AI option: {e}") from e
 

@@ -18,8 +18,11 @@ reset, speed, env selection, plots) with:
   whose episode ended is zeroed (mjlab's viewer never does this).
 * **Liquid AI (optional)**: only when a ``liquid`` runtime is passed
   (``contact-play --liquid True``): a text box whose instructions are turned
-  into validated planner commands by :mod:`contact_rl.runtime`. Without it the
-  viewer is unchanged.
+  into validated planner commands by :mod:`contact_rl.runtime`. In
+  ``closed_loop`` mode the instruction becomes a persistent mission and the
+  runtime keeps deciding from fresh robot feedback (``on_sim_step`` after every
+  env step); Pause / Resume / Stop and a target relative to the robot are
+  available. Without it the viewer is unchanged.
 
 All GUI callbacks only enqueue actions; they are executed on the simulation
 thread by ``BaseViewer._process_actions``.
@@ -139,10 +142,35 @@ class ContactPlayViewer(ViserPlayViewer):
       self._setup_liquid(gui)
 
   def _setup_liquid(self, gui) -> None:
+    closed = getattr(self._liquid, "mode", "oneshot") == "closed_loop"
     with gui.add_folder("Liquid AI"):
       self._liq_html = gui.add_html("")
       self._liq_text = gui.add_text("Instruction", initial_value="walk forward slowly")
-      b_send = gui.add_button("Send to Liquid AI")
+      b_send = gui.add_button("Send mission to Liquid AI" if closed else "Send to Liquid AI")
+      if closed:
+        b_pause = gui.add_button("Pause mission")
+        b_resume = gui.add_button("Start / resume mission")
+        self._liq_tf = gui.add_number("Target forward (m)", initial_value=2.0, step=0.1)
+        self._liq_tl = gui.add_number("Target left (m)", initial_value=0.0, step=0.1)
+        b_tset = gui.add_button("Set target (relative to robot at mission start)")
+        b_tclr = gui.add_button("Clear target")
+
+        @b_pause.on_click
+        def _(_) -> None:
+          self._liquid.send_pause()
+
+        @b_resume.on_click
+        def _(_) -> None:
+          self._liquid.send_resume()
+
+        @b_tset.on_click
+        def _(_) -> None:
+          self._liquid.send_target(self._liq_tf.value, self._liq_tl.value)
+
+        @b_tclr.on_click
+        def _(_) -> None:
+          self._liquid.send_target(None)
+
       b_stop = gui.add_button("STOP (no model)")
 
       @b_send.on_click
@@ -153,7 +181,8 @@ class ContactPlayViewer(ViserPlayViewer):
       def _(_) -> None:
         self._liquid.send_stop()
 
-    self._liquid.attach(self.request_action, self._term, self._ids, lambda: int(self._scene.env_idx))
+    self._liquid.attach(self.request_action, self._term, self._ids, lambda: int(self._scene.env_idx),
+                        step_dt=float(self.env.unwrapped.step_dt))
     self._liquid.start()  # loads the model on the worker thread; the sim keeps running
 
   def close(self) -> None:
@@ -205,6 +234,14 @@ class ContactPlayViewer(ViserPlayViewer):
     self._update_status_display()
     return True
 
+  def reset_environment(self) -> None:
+    super().reset_environment()
+    if self._liquid is not None:
+      with self._sim_lock:  # sim thread: invalidate in-flight decisions, end the mission
+        msg = self._liquid.on_env_reset()
+      if msg:
+        self._msg = "liquid: " + msg
+
   # ---------------------------------------------------------------- step
 
   def _execute_step(self) -> bool:
@@ -216,6 +253,8 @@ class ContactPlayViewer(ViserPlayViewer):
         if reset_recurrent_state(self.policy, dones):
           self._gru_resets += 1
           self._episode_ends += int((dones > 0).sum())
+        if self._liquid is not None:
+          self._liquid.on_sim_step(dones)  # feedback snapshot / safety / low-rate decision ticks
         self._step_count += 1
         self._stats_steps += 1
         return True
@@ -245,9 +284,12 @@ class ContactPlayViewer(ViserPlayViewer):
           {html.escape(self._msg)}{warn}
         </div>"""
       if self._liquid is not None and hasattr(self, "_liq_html"):
+        lines = self._liquid.status_lines() if hasattr(self._liquid, "status_lines") \
+          else [self._liquid.status_line()]
         self._liq_html.content = (
           '<div style="font-size:0.85em;line-height:1.3;padding:0 1em 0.5em 1em;">'
-          f"{html.escape(self._liquid.status_line())}<br/>{html.escape(self._liquid.last_msg)}</div>"
+          + "<br/>".join(html.escape(x) for x in lines)
+          + f"<br/><strong>{html.escape(self._liquid.last_msg)}</strong></div>"
         )
     except Exception:
       pass

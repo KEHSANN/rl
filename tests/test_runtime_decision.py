@@ -350,3 +350,333 @@ def test_decision_dataclass_is_immutable():
 def test_math_constants():
   assert MAX_SPEED_MPS["trot"] == pytest.approx(0.3 / 0.7) and MAX_SPEED_MPS["crawl"] == pytest.approx(0.3 / 1.4)
   assert math.isclose(Limits().yaw_rate_max, 1.0)
+
+
+# =====================================================================
+# Closed-loop mission mode (pure python; model answers are mocked)
+# =====================================================================
+from contact_rl.runtime.decision_loop import Result  # noqa: E402
+from contact_rl.runtime.decision_schema import (  # noqa: E402
+  ClosedLoopConfig,
+  MissionSpec,
+  RobotFeedback,
+  validate_mission,
+)
+from contact_rl.runtime.liquid_decider import (  # noqa: E402
+  answers_to_mission,
+  answers_to_tick_raw,
+  build_mission_questions,
+  build_tick_questions,
+  make_decide,
+)
+from contact_rl.runtime.mission import (  # noqa: E402
+  ACTIVE,
+  COMPLETE,
+  FINAL_TURN,
+  MissionTracker,
+  SafetySupervisor,
+)
+
+CL = ClosedLoopConfig()
+QM, QT = build_mission_questions(), build_tick_questions()
+
+
+def _a(**kw):
+  return {k: {"choice": v, "confidence": 0.9} for k, v in kw.items()}
+
+
+def _mission_ans(objective="walk", speed="unspecified", direction="keep", turn="keep", after_arrival="stop",
+                 gait="keep", caution="normal"):
+  return _a(objective=objective, speed=speed, direction=direction, turn=turn, after_arrival=after_arrival,
+            gait=gait, caution=caution)
+
+
+def _tick_ans(speed="keep", steer="keep", gait="keep", status="continue"):
+  return _a(speed=speed, steer=steer, gait=gait, status=status)
+
+
+def FB(seq=1, t=0.0, x=0.0, y=0.0, yaw=0.0, vx=0.0, vy=0.0, tilt=0.02, cmd=ST, match=1.0, wz=0.0):
+  return RobotFeedback(seq, t, time.monotonic(), 0, 0, x, y, yaw, vx, vy, wz, tilt, (True,) * 4, match, cmd)
+
+
+def SPEC(objective="walk", v=0.2, target=None, after="stop", cautious=False, gait=None, gait_free=False):
+  return MissionSpec(1, "test", objective, v, 0.0, 0.0, gait, gait_free, cautious, after, target)
+
+
+# ------------------------------------------------ instruction -> persistent mission
+def test_mission_questions_follow_decision_index_schema():
+  for q in (*QM.values(), *QT.values()):
+    assert q["type"] == "choice" and q["instructions"] and len(q["criteria"]) >= 2
+  assert {"objective", "speed", "after_arrival", "gait", "caution"} <= set(QM)
+  assert set(QT) == {"speed", "steer", "gait", "status"}
+
+
+@pytest.mark.parametrize("answers,expect", [
+  (_mission_ans(speed="slow", direction="forward"), dict(objective="walk", heading_offset=0.0)),
+  (_mission_ans("reach_target", after_arrival="turn_left"), dict(objective="reach_target", after_arrival="turn_left",
+                                                                yaw_rate=0.0)),
+  (_mission_ans(speed="medium"), dict(objective="walk")),
+  (_mission_ans(caution="cautious"), dict(cautious=True)),
+  (_mission_ans("reach_target", gait="suitable", caution="cautious"), dict(gait_free=True, gait=None, cautious=True)),
+])
+def test_example_instructions_become_missions(answers, expect):
+  raw = answers_to_mission(answers, QM, "x", ST, L, 0.5)
+  spec = validate_mission(raw, mission_id=7, limits=L, current=ST)
+  for k, v in expect.items():
+    assert getattr(spec, k) == v
+  assert 0.0 <= spec.preferred_speed <= L.speed_cap(("trot",))
+
+
+def test_relative_speed_is_resolved_once_at_interpretation():
+  raw = answers_to_mission(_mission_ans(speed="faster"), QM, "go faster", ST, L, 0.5)
+  assert raw["preferred_speed"] == pytest.approx(ST.speed + 0.05)  # fixed number, not a per-tick delta
+
+
+def test_cautious_mission_caps_the_desired_speed():
+  raw = answers_to_mission(_mission_ans(speed="fast", caution="cautious"), QM, "x", ST, L, 0.5)
+  assert raw["preferred_speed"] == pytest.approx(0.6 * L.speed_cap(("trot",)))
+
+
+@pytest.mark.parametrize("raw", [{"objective": "fly"}, {"objective": "walk", "gait": "gallop"},
+                                 {"objective": "walk", "preferred_speed": 9.0}, {"objective": "walk", "exec": 1},
+                                 {"objective": "walk", "after_arrival": "dance"}, "walk",
+                                 {"objective": "walk", "heading_offset": 1.0, "yaw_rate": 0.5}])
+def test_invalid_missions_rejected(raw):
+  with pytest.raises(DecisionError):
+    validate_mission(raw, mission_id=1, limits=L, current=ST)
+
+
+# ------------------------------------------------------------- tick mapping
+def test_tick_increase_is_bounded_by_the_mission_ceiling():
+  raw, _ = answers_to_tick_raw(_tick_ans("increase"), QT, ST, CL, ceiling=0.12, allowed_gaits=("trot",))
+  assert raw["speed"] == pytest.approx(0.12)
+  d = validate(raw, request_id=1, generation=1, current=ST, limits=L, kind="tick", speed_ceiling=0.12)
+  assert d.speed == pytest.approx(0.12)
+  with pytest.raises(DecisionError):  # a raw speed above the ceiling never passes validation
+    validate({"speed": 0.2}, request_id=1, generation=1, current=ST, limits=L, kind="tick", speed_ceiling=0.12)
+
+
+def test_repeated_increase_converges_to_the_ceiling_instead_of_compounding():
+  st = ST
+  for _ in range(20):
+    raw, _ = answers_to_tick_raw(_tick_ans("increase"), QT, st, CL, ceiling=0.2, allowed_gaits=("trot",))
+    d = validate(raw, request_id=1, generation=1, current=st, limits=L, kind="tick", speed_ceiling=0.2)
+    st = dataclasses.replace(st, speed=d.speed)
+  assert st.speed == pytest.approx(0.2)
+
+
+def test_keep_answer_is_a_noop_and_explicit_change_is_not():
+  raw, _ = answers_to_tick_raw(_tick_ans(), QT, ST, CL, 0.3, ("trot",))
+  assert validate(raw, request_id=1, generation=1, current=ST, limits=L, kind="tick").is_noop
+  raw, _ = answers_to_tick_raw(_tick_ans(steer="left"), QT, ST, CL, 0.3, ("trot",))
+  d = validate(raw, request_id=1, generation=1, current=ST, limits=L, kind="tick")
+  assert not d.is_noop and d.yaw_rate == pytest.approx(CL.turn_rate)
+
+
+def test_tick_stop_abort_and_gait_rules():
+  raw, _ = answers_to_tick_raw(_tick_ans("stop"), QT, ST, CL, 0.3, ("trot",))
+  assert raw["stop"] is True
+  raw, _ = answers_to_tick_raw(_tick_ans(status="abort"), QT, ST, CL, 0.3, ("trot",))
+  assert raw["stop"] is True and raw["mission_status"] == "abort"
+  with pytest.raises(DecisionError):  # gait not allowed by the mission
+    answers_to_tick_raw(_tick_ans(gait="bound"), QT, ST, CL, 0.3, ("trot",))
+  raw, _ = answers_to_tick_raw(_tick_ans(gait="crawl"), QT, ST, CL, 0.3, ("trot", "crawl"))
+  assert raw["gait"] == "crawl"
+
+
+def test_tick_validation_is_strict():
+  with pytest.raises(DecisionError):
+    validate({"mission_status": "done"}, request_id=1, generation=1, kind="tick")
+  with pytest.raises(DecisionError):  # mission_status is only accepted from ticks
+    validate({"mission_status": "complete"}, request_id=1, generation=1)
+  with pytest.raises(DecisionError):
+    answers_to_tick_raw(_a(speed="sprint", steer="keep", gait="keep", status="continue"), QT, ST, CL, 0.3, ("trot",))
+  d = validate({"mission_status": "complete"}, request_id=3, generation=2, kind="tick", mission_id=5, snapshot_seq=9)
+  assert (d.kind, d.mission_id, d.snapshot_seq, d.mission_status) == ("tick", 5, 9, "complete")
+
+
+def test_yaw_deescalation_is_immediate_and_result_stays_inside_the_cap():
+  sampled = PlannerState("trot", 0.1, 0.0, 1.94, ("trot",))  # training-sampled yaw above the runtime cap
+  assert V({"yaw_rate": 0.0}, current=sampled).yaw_rate == 0.0
+  d = V({"yaw_rate": 1.0}, current=sampled)
+  assert abs(d.yaw_rate) <= L.yaw_rate_max
+  d = V({"yaw_rate": -1.0}, current=sampled)  # reversal is rate-limited, then capped
+  assert d.yaw_rate == pytest.approx(1.0) and abs(d.yaw_rate) <= L.yaw_rate_max
+
+
+def test_model_answers_change_the_decision():
+  """The model genuinely contributes: different answers over the same state -> different commands."""
+  ctx = {"mission": {}, "_ceiling": 0.3, "_allowed_gaits": ("trot",)}
+  outs = []
+  for ans in (_tick_ans("increase", "left"), _tick_ans("decrease", "right"), _tick_ans()):
+    decide = make_decide(lambda s, q, a=ans: a, L, 0.5, CL)
+    outs.append(decide(Request(1, 1, "x", ST, 0.0, kind="tick", mission_id=1, snapshot_seq=1, context=ctx)))
+  assert outs[0].speed > ST.speed and outs[0].yaw_rate > 0
+  assert outs[1].speed < ST.speed and outs[1].yaw_rate < 0
+  assert outs[2].is_noop
+
+
+def test_tick_request_sends_the_feedback_context_to_system_one():
+  seen = []
+  ctx = {"mission": {"phase": "approach"}, "measured state": {"body tilt": "3.0 deg"}, "_ceiling": 0.3,
+         "_allowed_gaits": ("trot",)}
+  decide = make_decide(lambda s, q: seen.append((s, sorted(q))) or _tick_ans(), L, 0.5, CL)
+  decide(Request(1, 1, "x", ST, 0.0, kind="tick", mission_id=1, snapshot_seq=1, context=ctx))
+  state, names = seen[0]
+  assert names == ["gait", "speed", "status", "steer"]
+  assert state["measured state"]["body tilt"] == "3.0 deg" and "_ceiling" not in state
+
+
+# ------------------------------------------------------------ config / timing
+def test_closed_loop_config_validation_and_latency_bounded_period():
+  with pytest.raises(ValueError):
+    ClosedLoopConfig(decision_hz=50.0)
+  with pytest.raises(ValueError):
+    ClosedLoopConfig(tilt_abort_rad=math.radians(85))
+  assert CL.decision_period(None) == pytest.approx(1.0)
+  assert CL.decision_period(0.8) == pytest.approx(1.6)  # never faster than 2 x measured latency
+
+
+def test_feedback_finiteness():
+  assert FB().is_finite and not FB(vx=float("nan")).is_finite and not FB(match=float("inf")).is_finite
+
+
+# --------------------------------------------------- decision loop: ticks
+def test_tick_does_not_bump_generation_and_is_bounded():
+  loop, out = _loop(lambda req: V({}, rid=req.request_id, gen=req.generation))
+  mreq = loop.submit("walk", ST, kind="mission")
+  assert loop.submit_tick("walk", ST, mission_id=1, snapshot_seq=0, context={}) is None  # mission pending
+  loop.process(mreq)
+  g = mreq.generation
+  t1 = loop.submit_tick("walk", ST, mission_id=g, snapshot_seq=1, context={})
+  assert t1 is not None and loop.generation == g
+  assert loop.submit_tick("walk", ST, mission_id=g, snapshot_seq=2, context={}) is None  # slot busy
+  assert loop.counts["skipped_busy"] == 2
+
+
+def test_out_of_order_snapshot_is_not_current():
+  loop, out = _loop(lambda req: V({}, rid=req.request_id, gen=req.generation))
+  loop._pending = None
+  newer = Result(Request(5, 0, "", ST, 0.0, kind="tick", snapshot_seq=10), Decision(5, 0), 0.0)
+  older = Result(Request(6, 0, "", ST, 0.0, kind="tick", snapshot_seq=9), Decision(6, 0), 0.0)
+  assert loop.is_current(newer)
+  loop.mark_applied(newer)
+  assert not loop.is_current(older)  # higher request id, but computed from an older snapshot
+
+
+def test_deadline_is_counted_once_and_late_answer_discarded():
+  release = threading.Event()
+  loop, out = _loop(lambda req: (release.wait(5), V({}, rid=req.request_id, gen=req.generation))[1], timeout_s=0.05)
+  loop.start()
+  loop.submit_tick("x", ST, mission_id=0, snapshot_seq=1, context={})
+  deadline = time.monotonic() + 2
+  while loop.inflight_age() is None and time.monotonic() < deadline:
+    time.sleep(0.005)
+  time.sleep(0.08)
+  assert loop.flag_deadline() and not loop.flag_deadline()
+  release.set()
+  time.sleep(0.2)
+  loop.stop()
+  assert out == [] and loop.counts["timeout"] == 1 and loop.consecutive_failures == 1
+
+
+def test_consecutive_failures_reset_after_a_delivered_answer():
+  answers = iter([RuntimeError("x"), RuntimeError("y"), None])
+
+  def decide(req):
+    a = next(answers)
+    if a is not None:
+      raise a
+    return V({}, rid=req.request_id, gen=req.generation)
+  loop, out = _loop(decide)
+  for i in range(2):
+    loop.process(loop.submit_tick("x", ST, mission_id=0, snapshot_seq=i, context={}))
+  assert loop.consecutive_failures == 2
+  loop.process(loop.submit_tick("x", ST, mission_id=0, snapshot_seq=5, context={}))
+  assert loop.consecutive_failures == 0 and len(out) == 1
+
+
+# ------------------------------------------------------------ mission tracker
+def test_context_uses_measured_values_and_reports_previous_outcome():
+  m = MissionTracker(SPEC("reach_target", target=(2.0, 1.0)), FB(), CL)
+  m.record(Decision(1, 1, speed=0.2), FB(t=0.0), applied=True)
+  ctx = m.context(FB(seq=2, t=1.0, x=0.5, vx=0.18, tilt=math.radians(4)), ("trot",), ())
+  assert ctx["measured state"]["forward velocity"] == "+0.18 m/s"
+  assert ctx["measured state"]["body tilt"] == "4.0 deg"
+  assert ctx["target"]["distance"] == f"{math.hypot(1.5, 1.0):.2f} m" and "left" in ctx["target"]["direction"]
+  assert ctx["previous decision"]["result"].startswith("distance decreased")
+  assert ctx["mission"]["user instruction"] == "test"
+
+
+def test_context_without_target_says_so_instead_of_inventing_one():
+  m = MissionTracker(SPEC("walk"), FB(), CL)
+  ctx = m.context(FB(), ("trot",), ())
+  assert "target" not in ctx
+  m2 = MissionTracker(SPEC("reach_target"), FB(), CL)
+  assert m2.context(FB(), ("trot",), ())["target"] == "not configured"
+
+
+def test_arrival_final_turn_and_measured_completion():
+  m = MissionTracker(SPEC("reach_target", target=(1.0, 0.0), after="turn_left"), FB(), CL)
+  assert m.phase_update(FB(x=0.5)) is None and m.state == ACTIVE
+  assert m.phase_update(FB(x=0.9, yaw=0.1)) == "arrived" and m.phase == FINAL_TURN and m.speed_ceiling() == 0.0
+  assert m.phase_update(FB(x=0.9, yaw=0.1 + math.radians(50))) is None
+  assert m.phase_update(FB(x=0.9, yaw=0.1 + math.radians(80))) == "complete" and m.state == COMPLETE
+
+
+def test_reach_and_stop_completes_on_tolerance_only():
+  m = MissionTracker(SPEC("reach_target", target=(1.0, 0.0)), FB(), CL)
+  assert m.phase_update(FB(t=500.0, x=0.0)) is None  # elapsed time alone never completes a mission
+  assert m.phase_update(FB(x=1.0 - CL.arrive_tol_m + 0.01)) == "complete"
+
+
+def test_walk_missions_never_complete_on_their_own():
+  m = MissionTracker(SPEC("walk"), FB(), CL)
+  assert not m.evidence_complete(FB(t=1e4, x=100.0))
+
+
+# ------------------------------------------------------------- safety
+SV = SafetySupervisor(CL)
+
+
+def test_safety_non_finite_and_tilt_abort_always_win():
+  m = MissionTracker(SPEC(), FB(), CL)
+  a = SV.check(m, FB(vx=float("nan")), 0, 0.0)
+  assert a.stop and a.fail_mission
+  a = SV.check(None, FB(tilt=math.radians(50)), 0, None)  # even without a mission
+  assert a.stop
+
+
+def test_safety_tilt_caution_reduces_speed_and_is_tighter_when_cautious():
+  cmd = dataclasses.replace(ST, speed=0.2)
+  a = SV.check(MissionTracker(SPEC(), FB(), CL), FB(cmd=cmd, tilt=math.radians(22), vx=0.2), 0, 0.0)
+  assert not a.stop and a.speed == pytest.approx(0.1)
+  assert SV.check(MissionTracker(SPEC(), FB(), CL), FB(cmd=cmd, tilt=math.radians(15), vx=0.2), 0, 0.0) is None
+  a = SV.check(MissionTracker(SPEC(cautious=True), FB(), CL), FB(cmd=cmd, tilt=math.radians(15), vx=0.2), 0, 0.0)
+  assert a.speed == pytest.approx(0.1)
+
+
+def test_safety_inference_failures_and_missing_decisions_stop_the_robot():
+  m = MissionTracker(SPEC(), FB(), CL)
+  assert SV.check(m, FB(), CL.max_consecutive_failures, 0.0).stop
+  assert SV.check(m, FB(), 0, CL.fallback_hold_s + 0.1).stop
+  assert SV.check(m, FB(), CL.max_consecutive_failures - 1, CL.fallback_hold_s - 0.1) is None
+
+
+def test_safety_no_progress_toward_target():
+  m = MissionTracker(SPEC("reach_target", target=(3.0, 0.0)), FB(), CL)
+  assert SV.check(m, FB(t=0.0), 0, 0.0) is None
+  assert SV.check(m, FB(t=5.0, x=-0.3), 0, 0.0) is None  # first turns away: tolerated
+  assert SV.check(m, FB(t=7.0, x=0.2), 0, 0.0) is None  # improved -> window restarts
+  a = SV.check(m, FB(t=7.0 + CL.no_progress_s, x=0.25), 0, 0.0)
+  assert a.stop and "no progress" in a.reason
+
+
+def test_safety_no_progress_walk_mission():
+  cmd = dataclasses.replace(ST, speed=0.2)
+  m = MissionTracker(SPEC(), FB(), CL)
+  assert SV.check(m, FB(t=0.0, cmd=cmd, vx=0.0), 0, 0.0) is None
+  assert SV.check(m, FB(t=CL.no_progress_s + 0.1, cmd=cmd, vx=0.01), 0, 0.0).stop
+  m = MissionTracker(SPEC(), FB(), CL)
+  SV.check(m, FB(t=0.0, cmd=cmd, vx=0.0), 0, 0.0)
+  assert SV.check(m, FB(t=CL.no_progress_s + 0.1, cmd=cmd, vx=0.15), 0, 0.0) is None
