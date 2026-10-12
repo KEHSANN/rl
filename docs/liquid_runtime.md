@@ -83,10 +83,15 @@ control and measure only the env selected when the mission starts.
 
 ```bash
 uv run --with "transformers>=5.19" --with "torchao>=0.18" --with pillow \
-  contact-play Mjlab-Contact-Flat-Unitree-Go2 --checkpoint best --num-envs 1 \
+  contact-play Mjlab-Contact-Flat-Unitree-Go2 --run-root weights --checkpoint best --num-envs 1 \
   --liquid True --liquid-mode closed_loop --liquid-decision-hz 1.0 \
-  --liquid-target 2.0 0.0 --liquid-stdin True
+  --liquid-target "(2.0, 0.0)" --liquid-stdin True
 ```
+
+Tuple options use Python syntax (mjlab's tyro settings): `--liquid-target 2.0 0.0`
+is rejected with `Unrecognized options: 0.0`. `--run-root weights` selects the
+committed trained run; plain `--checkpoint best` resolves to the older
+`runs/go2_contact/2026-10-01_04-21-51/checkpoints/model_1999.pt` in a fresh clone.
 
 Panel (closed loop): *Send mission to Liquid AI*, *Pause mission*,
 *Start / resume mission*, *Target forward/left* + *Set target*,
@@ -102,7 +107,7 @@ Headless closed-loop rollout (same runtime, no viewer; JSON report):
 
 ```bash
 uv run --with "transformers>=5.19" --with "torchao>=0.18" --with pillow \
-  python -m contact_rl.runtime.rollout --checkpoint best --decider liquid \
+  python -m contact_rl.runtime.rollout --run-root weights --checkpoint best --decider liquid \
   --instruction "Move toward the target and turn left." --target 1.5 0.5 --seconds 40
 ```
 
