@@ -1,0 +1,37 @@
+# Optional systemd *user* unit (alternative to tmux). The instance name is the
+# task id. Run `bash scripts/vps/setup.sh` first (the unit never syncs the env),
+# edit WorkingDirectory / ExecStart args if needed, then:
+#   mkdir -p ~/.config/systemd/user && cp scripts/vps/systemd/*.service ~/.config/systemd/user/
+#   loginctl enable-linger $USER          # keep user units running after logout
+#   systemctl --user daemon-reload
+#   systemctl --user start contact-train@Mjlab-Contact-Flat-Unitree-Go2
+#   journalctl --user -u contact-train@Mjlab-Contact-Flat-Unitree-Go2 -f
+# Uses the task's own num_envs (paper default 8192). On a lower-VRAM GPU add
+# `--env.scene.num-envs 4096` to ExecStart (or a drop-in via `systemctl --user edit`).
+# `systemctl --user stop` sends SIGTERM -> checkpoint -> clean exit (also while
+# the env is still being built: run_info.json is finalised as "stopped").
+# KillMode=mixed: SIGTERM goes to `uv` only (uv forwards it to contact-train);
+# SIGKILL after TimeoutStopSec still reaches the whole cgroup.
+# UV_NO_SYNC=1: plain `uv run` would re-sync the env without `--extra cu128`
+# and swap the CUDA torch build. PYTHONUNBUFFERED=1: the journal gets log lines
+# immediately (runs/<exp>/<run>/logs/train.log is written either way).
+# uv's default install location is ~/.local/bin; adjust ExecStart if `which uv`
+# says otherwise. (No network-online.target: user managers do not have it.)
+[Unit]
+Description=contact-rl training (%i)
+
+[Service]
+Type=simple
+WorkingDirectory=%h/rl
+Environment=MUJOCO_GL=egl
+Environment=PYOPENGL_PLATFORM=egl
+Environment=PYTHONUNBUFFERED=1
+Environment=UV_NO_SYNC=1
+ExecStart=%h/.local/bin/uv run contact-train %i
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=300
+Restart=no
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,96 @@
+{
+  "status": "finished",
+  "task": "Mjlab-Contact-Flat-Unitree-Go2",
+  "started": "2026-10-04T03:24:00+00:00",
+  "pid": 57162,
+  "argv": [
+    "/root/rl/.venv/bin/contact-train",
+    "Mjlab-Contact-Flat-Unitree-Go2",
+    "--resume-from",
+    "runs/go2_contact/2026-10-04_02-51-44/checkpoints/model_499.pt",
+    "--agent.max-iterations",
+    "2000"
+  ],
+  "experiment": "go2_contact",
+  "device": "cuda:0",
+  "gpu_ids": [
+    0
+  ],
+  "num_envs": 8192,
+  "max_iterations": 2000,
+  "seed": 42,
+  "logger": "tensorboard",
+  "nan_guard": false,
+  "git": {
+    "commit": "2bd51a1cf216cb1d69af3097bdc10dff5bc50791",
+    "branch": "audit/paper-alignment",
+    "dirty": false
+  },
+  "versions": {
+    "contact-rl": "0.1.0",
+    "mjlab": "1.2.0",
+    "torch": "2.13.0",
+    "mujoco": "3.5.0",
+    "mujoco-warp": "3.5.0.2",
+    "warp-lang": "1.16.0",
+    "rsl-rl-lib": "5.0.1",
+    "numpy": "2.5.2",
+    "tensordict": "0.14.0",
+    "tensorboard": "2.21.0",
+    "tyro": "1.0.16",
+    "viser": "1.1.0",
+    "mediapy": "1.2.7",
+    "imageio-ffmpeg": "0.6.0",
+    "pillow": "12.3.0",
+    "onnx": "1.22.0",
+    "onnxscript": "0.7.1",
+    "onnxruntime": null,
+    "PyOpenGL": "3.1.10",
+    "GitPython": "3.1.60",
+    "wandb": "0.28.2"
+  },
+  "hardware": {
+    "python": "3.12.3",
+    "platform": "Linux-6.8.0-53-generic-x86_64-with-glibc2.39",
+    "cpu_count": 16,
+    "ram_gib": 31.3,
+    "torch_cuda": "13.0",
+    "gpus": [
+      {
+        "index": 0,
+        "name": "NVIDIA GeForce RTX 3080 Ti",
+        "vram_gib": 11.6,
+        "capability": "8.6"
+      }
+    ]
+  },
+  "mujoco_gl": "egl",
+  "resume": {
+    "source": "/root/rl/runs/go2_contact/2026-10-04_02-51-44/checkpoints/model_499.pt",
+    "source_run": "/root/rl/runs/go2_contact/2026-10-04_02-51-44",
+    "source_iteration": 499,
+    "start_iteration": 500
+  },
+  "retention": {
+    "keep_last": 5,
+    "keep_every": 1000,
+    "keep_best": true
+  },
+  "last_checkpoint": "model_2499.pt",
+  "last_iteration": 2499,
+  "updated": "2026-10-04T04:50:02+00:00",
+  "onnx_export": {
+    "status": "ok",
+    "path": "runs/go2_contact/2026-10-04_03-24-00/exported/policy.onnx",
+    "error": null,
+    "metadata": "attached"
+  },
+  "onnx_export_error": null,
+  "wall_time_s": 5145.6,
+  "stopped": null,
+  "finished": "2026-10-04T04:50:02+00:00",
+  "exit_code": 0,
+  "error": null,
+  "stop_reason": null,
+  "last_checkpoint_iteration": 2499
+}

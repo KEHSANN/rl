@@ -1,0 +1,289 @@
+{
+  "checkpoints": [
+    {
+      "iteration": 500,
+      "file": "model_500.pt",
+      "time": "2026-10-04T03:24:20+00:00",
+      "mean_episode_reward": 1.58383724629879,
+      "deleted": true
+    },
+    {
+      "iteration": 550,
+      "file": "model_550.pt",
+      "time": "2026-10-04T03:26:28+00:00",
+      "mean_episode_reward": 77.56173603057861,
+      "deleted": true
+    },
+    {
+      "iteration": 600,
+      "file": "model_600.pt",
+      "time": "2026-10-04T03:28:36+00:00",
+      "mean_episode_reward": 78.04061925411224,
+      "deleted": true
+    },
+    {
+      "iteration": 650,
+      "file": "model_650.pt",
+      "time": "2026-10-04T03:30:44+00:00",
+      "mean_episode_reward": 79.74682987213134,
+      "deleted": true
+    },
+    {
+      "iteration": 700,
+      "file": "model_700.pt",
+      "time": "2026-10-04T03:32:53+00:00",
+      "mean_episode_reward": 83.15992900848389,
+      "deleted": true
+    },
+    {
+      "iteration": 750,
+      "file": "model_750.pt",
+      "time": "2026-10-04T03:35:01+00:00",
+      "mean_episode_reward": 80.74817988395691,
+      "deleted": true
+    },
+    {
+      "iteration": 800,
+      "file": "model_800.pt",
+      "time": "2026-10-04T03:37:09+00:00",
+      "mean_episode_reward": 81.69983966827392,
+      "deleted": true
+    },
+    {
+      "iteration": 850,
+      "file": "model_850.pt",
+      "time": "2026-10-04T03:39:17+00:00",
+      "mean_episode_reward": 81.12442795753479,
+      "deleted": true
+    },
+    {
+      "iteration": 900,
+      "file": "model_900.pt",
+      "time": "2026-10-04T03:41:25+00:00",
+      "mean_episode_reward": 80.75700993776321,
+      "deleted": true
+    },
+    {
+      "iteration": 950,
+      "file": "model_950.pt",
+      "time": "2026-10-04T03:43:33+00:00",
+      "mean_episode_reward": 85.49242901563645,
+      "deleted": true
+    },
+    {
+      "iteration": 1000,
+      "file": "model_1000.pt",
+      "time": "2026-10-04T03:45:42+00:00",
+      "mean_episode_reward": 83.09104011535645
+    },
+    {
+      "iteration": 1050,
+      "file": "model_1050.pt",
+      "time": "2026-10-04T03:47:50+00:00",
+      "mean_episode_reward": 83.2608259600401,
+      "deleted": true
+    },
+    {
+      "iteration": 1100,
+      "file": "model_1100.pt",
+      "time": "2026-10-04T03:49:58+00:00",
+      "mean_episode_reward": 83.63969975948334,
+      "deleted": true
+    },
+    {
+      "iteration": 1150,
+      "file": "model_1150.pt",
+      "time": "2026-10-04T03:52:07+00:00",
+      "mean_episode_reward": 85.01008460998536,
+      "deleted": true
+    },
+    {
+      "iteration": 1200,
+      "file": "model_1200.pt",
+      "time": "2026-10-04T03:54:19+00:00",
+      "mean_episode_reward": 86.66886074066161,
+      "deleted": true
+    },
+    {
+      "iteration": 1250,
+      "file": "model_1250.pt",
+      "time": "2026-10-04T03:56:27+00:00",
+      "mean_episode_reward": 85.9020138168335,
+      "deleted": true
+    },
+    {
+      "iteration": 1300,
+      "file": "model_1300.pt",
+      "time": "2026-10-04T03:58:36+00:00",
+      "mean_episode_reward": 83.83080814599991,
+      "deleted": true
+    },
+    {
+      "iteration": 1350,
+      "file": "model_1350.pt",
+      "time": "2026-10-04T04:00:44+00:00",
+      "mean_episode_reward": 83.40695421218872,
+      "deleted": true
+    },
+    {
+      "iteration": 1400,
+      "file": "model_1400.pt",
+      "time": "2026-10-04T04:02:52+00:00",
+      "mean_episode_reward": 83.20925771713257,
+      "deleted": true
+    },
+    {
+      "iteration": 1450,
+      "file": "model_1450.pt",
+      "time": "2026-10-04T04:05:01+00:00",
+      "mean_episode_reward": 85.19380230426788,
+      "deleted": true
+    },
+    {
+      "iteration": 1500,
+      "file": "model_1500.pt",
+      "time": "2026-10-04T04:07:10+00:00",
+      "mean_episode_reward": 86.6919669342041,
+      "deleted": true
+    },
+    {
+      "iteration": 1550,
+      "file": "model_1550.pt",
+      "time": "2026-10-04T04:09:18+00:00",
+      "mean_episode_reward": 86.01443626403808,
+      "deleted": true
+    },
+    {
+      "iteration": 1600,
+      "file": "model_1600.pt",
+      "time": "2026-10-04T04:11:26+00:00",
+      "mean_episode_reward": 88.18849039077759,
+      "deleted": true
+    },
+    {
+      "iteration": 1650,
+      "file": "model_1650.pt",
+      "time": "2026-10-04T04:13:35+00:00",
+      "mean_episode_reward": 88.16301223754883,
+      "deleted": true
+    },
+    {
+      "iteration": 1700,
+      "file": "model_1700.pt",
+      "time": "2026-10-04T04:15:44+00:00",
+      "mean_episode_reward": 87.41572561979294,
+      "deleted": true
+    },
+    {
+      "iteration": 1750,
+      "file": "model_1750.pt",
+      "time": "2026-10-04T04:17:52+00:00",
+      "mean_episode_reward": 84.72852002620697,
+      "deleted": true
+    },
+    {
+      "iteration": 1800,
+      "file": "model_1800.pt",
+      "time": "2026-10-04T04:20:03+00:00",
+      "mean_episode_reward": 84.81713315963745,
+      "deleted": true
+    },
+    {
+      "iteration": 1850,
+      "file": "model_1850.pt",
+      "time": "2026-10-04T04:22:13+00:00",
+      "mean_episode_reward": 89.89709310531616,
+      "deleted": true
+    },
+    {
+      "iteration": 1900,
+      "file": "model_1900.pt",
+      "time": "2026-10-04T04:24:23+00:00",
+      "mean_episode_reward": 85.93909281253815,
+      "deleted": true
+    },
+    {
+      "iteration": 1950,
+      "file": "model_1950.pt",
+      "time": "2026-10-04T04:26:31+00:00",
+      "mean_episode_reward": 87.55836896896362,
+      "deleted": true
+    },
+    {
+      "iteration": 2000,
+      "file": "model_2000.pt",
+      "time": "2026-10-04T04:28:40+00:00",
+      "mean_episode_reward": 85.38354341506958
+    },
+    {
+      "iteration": 2050,
+      "file": "model_2050.pt",
+      "time": "2026-10-04T04:30:48+00:00",
+      "mean_episode_reward": 89.64590602874756,
+      "deleted": true
+    },
+    {
+      "iteration": 2100,
+      "file": "model_2100.pt",
+      "time": "2026-10-04T04:32:56+00:00",
+      "mean_episode_reward": 88.38453962564468,
+      "deleted": true
+    },
+    {
+      "iteration": 2150,
+      "file": "model_2150.pt",
+      "time": "2026-10-04T04:35:05+00:00",
+      "mean_episode_reward": 89.69718240737915,
+      "deleted": true
+    },
+    {
+      "iteration": 2200,
+      "file": "model_2200.pt",
+      "time": "2026-10-04T04:37:14+00:00",
+      "mean_episode_reward": 88.91300215244293,
+      "deleted": true
+    },
+    {
+      "iteration": 2250,
+      "file": "model_2250.pt",
+      "time": "2026-10-04T04:39:22+00:00",
+      "mean_episode_reward": 88.62140175819397,
+      "deleted": true
+    },
+    {
+      "iteration": 2300,
+      "file": "model_2300.pt",
+      "time": "2026-10-04T04:41:30+00:00",
+      "mean_episode_reward": 87.77907970905304
+    },
+    {
+      "iteration": 2350,
+      "file": "model_2350.pt",
+      "time": "2026-10-04T04:43:38+00:00",
+      "mean_episode_reward": 89.6510095500946
+    },
+    {
+      "iteration": 2400,
+      "file": "model_2400.pt",
+      "time": "2026-10-04T04:45:47+00:00",
+      "mean_episode_reward": 92.0887261581421
+    },
+    {
+      "iteration": 2450,
+      "file": "model_2450.pt",
+      "time": "2026-10-04T04:47:56+00:00",
+      "mean_episode_reward": 94.0566372537613
+    },
+    {
+      "iteration": 2499,
+      "file": "model_2499.pt",
+      "time": "2026-10-04T04:50:01+00:00",
+      "mean_episode_reward": 87.9936491882801
+    }
+  ],
+  "best": {
+    "iteration": 2450,
+    "metric": "mean_episode_reward",
+    "value": 94.0566372537613
+  }
+}

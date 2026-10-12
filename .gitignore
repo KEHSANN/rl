@@ -14,9 +14,12 @@ dist/
 .mypy_cache/
 .pytest_cache/
 
-# Training artefacts
+# Training / evaluation artefacts
+runs/
 logs/
 outputs/
 wandb/
 *.pt
 *.onnx
+*.onnx.tmp
+*.mp4
