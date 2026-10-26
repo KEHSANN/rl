@@ -1,6 +1,12 @@
 import os
 
-import wandb
+try:
+  import wandb
+except ImportError:  # runtime-only branch: wandb lives in mjlab[train], not installed
+  # wandb is only touched in save(), behind a logger_type == "wandb" guard
+  # (and that whole block is already try/except'd); play/eval never call
+  # save(), so importing this runner must not require wandb.
+  wandb = None  # type: ignore[assignment]
 
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.rl.exporter_utils import (

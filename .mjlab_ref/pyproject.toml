@@ -59,6 +59,12 @@ dependencies = [
 # contact-doctor, contact-bench and the Liquid rollout never call learn(),
 # so the rsl-rl TensorBoard/W&B writer is never created on this branch.
 # Request it on the full branch with: mjlab[train]
+# Note: the manipulation/tracking/velocity runners used to do a top-level
+# `import wandb`, which broke task registration entirely without wandb
+# (play/rollout died in require_tasks() before any simulation). Those
+# runners now import wandb optionally (wandb = None); wandb is only
+# touched in save() behind a logger_type == "wandb" guard, and play/eval
+# never call save(). So this branch runs without wandb installed.
 train = [
   "torchrunx>=0.3.4",
   "tensorboard>=2.20.0",

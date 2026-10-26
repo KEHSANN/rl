@@ -2,7 +2,14 @@ import os
 from typing import cast
 
 import torch
-import wandb
+
+try:
+  import wandb
+except ImportError:  # runtime-only branch: wandb lives in mjlab[train], not installed
+  # wandb is only touched in save(), behind a logger_type == "wandb" guard
+  # (and that whole block is already try/except'd); play/eval never call
+  # save(), so importing this runner must not require wandb.
+  wandb = None  # type: ignore[assignment]
 from rsl_rl.env.vec_env import VecEnv
 from torch import nn
 

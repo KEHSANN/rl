@@ -37,6 +37,17 @@ bash scripts/vps/setup-runtime.sh
 `docs/VPS_RUNTIME_ONLY.md` آمده).
 
 چی نصب نمی‌شود: `wandb`، `tensorboard`، `torchrunx`، `contact-train`، و
+
+> اصلاحیه (بعد از تست CPU): نسخه اول این شاخه با همین حذف `wandb` اصلاً
+> اجرا نمی‌شد — چون رجیستر تسک‌های `mjlab`، رانرهای manipulation /
+> tracking / velocity را ایمپورت می‌کند که در سطح ماژول `import wandb`
+> داشتند و `require_tasks()` قبل از هر شبیه‌سازی می‌مرد. آن سه رانر
+> حالا `wandb` را اختیاری ایمپورت می‌کنند (`wandb = None` در صورت
+> نبودن)؛ چون `wandb` فقط در `save()` و پشت گارد `logger_type ==
+> "wandb"` لمس می‌شود و `play`/`eval`/`rollout` هیچ‌وقت `save()` را
+> صدا نمی‌زنند، اجرا بدون `wandb` کار می‌کند. اگر `--agent.logger
+> wandb` یا `--wandb-run-path` بدهی، آن مسیرها مثل قبل به `wandb`
+> نیاز دارند و روی این شاخه کار نمی‌کنند.
 روی این ماشین `transformers`/`torchao`/`pillow` برای Liquid هم نصب
 نمی‌شود — چون `remote_decider.py` فقط از کتابخانه‌ی استاندارد پایتون
 استفاده می‌کند و `liquid_decider.py` هم `torch`/`transformers` را فقط
