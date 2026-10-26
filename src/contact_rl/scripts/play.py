@@ -30,9 +30,10 @@ leaves it open.
 
 from __future__ import annotations
 
+import os
 import socket
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from contact_rl.scripts import taskless_help
@@ -56,6 +57,10 @@ optional Liquid AI runtime (Viser viewer only; off by default):
   --liquid BOOL                  enable LiquidAI high-level decisions   (default: False)
   --liquid-model ID              HF model id        (default: LiquidAI/d1-3B-w8a8)
   --liquid-device DEV            model device       (default: cuda)
+  --liquid-decider MODE          local | remote     (default: local)
+  --liquid-api-url URL           remote model server base URL (default: $LIQUID_API_URL or http://127.0.0.1:8001)
+  --liquid-api-key KEY           Bearer token for remote (default: $LIQUID_API_KEY; never commit it)
+  --liquid-api-timeout-s S       remote HTTP timeout  (default: 1.8, below the 2.0 s tick deadline)
   --liquid-stdin BOOL            also read instructions from this terminal
   --liquid-timeout-s S           discard decisions slower than this      (default: 5.0)
   --liquid-speed-fraction F      speed cap, fraction of trained max (0,1] (default: 0.8)
@@ -97,6 +102,17 @@ def _config_cls():
     liquid_model: str = "LiquidAI/d1-3B-w8a8"
     liquid_device: str = "cuda"
     liquid_compile: bool = True
+    liquid_decider: str = "local"
+    """local: load the d1 model on this machine (needs transformers/torchao);
+    remote: ask a model_server.py instance over HTTP (stdlib only, no Liquid
+    packages needed here). The remote model is the one that answers, e.g. the
+    bf16 d1-3B on molab behind the VPS relay."""
+    liquid_api_url: str = ""
+    """Remote base URL; empty means $LIQUID_API_URL, else http://127.0.0.1:8001."""
+    liquid_api_key: str | None = None
+    """Bearer token for remote; None means $LIQUID_API_KEY. Never commit it."""
+    liquid_api_timeout_s: float = 1.8
+    """Remote HTTP timeout; must stay below the 2.0 s tick deadline."""
     liquid_stdin: bool = False
     """Also read natural-language instructions from stdin ('stop' = immediate stop)."""
     liquid_timeout_s: float = 5.0
@@ -124,7 +140,6 @@ def build_liquid_runtime(cfg):
   if not getattr(cfg, "liquid", False):
     return None
   from contact_rl.runtime.decision_schema import ClosedLoopConfig, Limits
-  from contact_rl.runtime.viewer_bridge import build_runtime
 
   try:
     limits = Limits(speed_fraction=cfg.liquid_speed_fraction, yaw_rate_max=cfg.liquid_yaw_max,
@@ -133,9 +148,30 @@ def build_liquid_runtime(cfg):
     mode = getattr(cfg, "liquid_mode", "closed_loop")
     cl = ClosedLoopConfig(decision_hz=getattr(cfg, "liquid_decision_hz", 1.0),
                           deadline_s=getattr(cfg, "liquid_decision_deadline_s", 2.0))
-    rt = build_runtime(model_id=cfg.liquid_model, device=cfg.liquid_device, compile=cfg.liquid_compile,
-                       limits=limits, yaw_rate=cfg.liquid_yaw_rate, timeout_s=cfg.liquid_timeout_s, mode=mode,
-                       closed_loop=cl, autostart=getattr(cfg, "liquid_autostart", True))
+    decider = getattr(cfg, "liquid_decider", "local")
+    if decider not in ("local", "remote"):
+      raise ValueError(f"--liquid-decider must be local or remote, got {decider!r}")
+    if decider == "remote":
+      # New on this branch: same LiquidRuntime as local, only system_one
+      # moves. No transformers/torchao import here; RemoteDecider is stdlib.
+      from contact_rl.runtime.liquid_decider import make_decide
+      from contact_rl.runtime.remote_decider import RemoteDecider
+      from contact_rl.runtime.viewer_bridge import LiquidRuntime
+
+      api_url = (getattr(cfg, "liquid_api_url", "") or os.environ.get("LIQUID_API_URL")
+                 or "http://127.0.0.1:8001")
+      dec = RemoteDecider(api_url, api_key=getattr(cfg, "liquid_api_key", None),
+                          timeout_s=getattr(cfg, "liquid_api_timeout_s", 1.8))
+      cl_remote = replace(cl, turn_rate=abs(cfg.liquid_yaw_rate))
+      rt = LiquidRuntime(lambda lim: make_decide(dec.ask, lim, cfg.liquid_yaw_rate, cl_remote),
+                         dec.load, limits, timeout_s=cfg.liquid_timeout_s, mode=mode,
+                         closed_loop=cl_remote, autostart=getattr(cfg, "liquid_autostart", True))
+    else:
+      from contact_rl.runtime.viewer_bridge import build_runtime
+
+      rt = build_runtime(model_id=cfg.liquid_model, device=cfg.liquid_device, compile=cfg.liquid_compile,
+                         limits=limits, yaw_rate=cfg.liquid_yaw_rate, timeout_s=cfg.liquid_timeout_s, mode=mode,
+                         closed_loop=cl, autostart=getattr(cfg, "liquid_autostart", True))
     target = getattr(cfg, "liquid_target", None)
     if target is not None:
       if mode != "closed_loop":

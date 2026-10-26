@@ -8,6 +8,8 @@ Linux x86_64 + NVIDIA, no Docker. All scripts `source common.sh`, which `cd`s to
 |---|---|---|
 | `setup.sh [doctor args]` | `uv sync --extra cu128 --python 3.12 --frozen`, then `contact-doctor` | `EXTRA=cpu` |
 | `setup-runtime.sh [doctor args]` | **Runtime-only branch only:** `uv lock` + `uv sync --extra cu128`, then `contact-doctor`. No wandb / tensorboard / torchrunx, no `contact-train`. See `docs/VPS_RUNTIME_ONLY.md`. | `EXTRA=cpu` |
+| `run-remote-play.sh [contact-play args]` | **This branch only:** trained checkpoint + remote Liquid model (molab) in the Viser viewer. Requires `LIQUID_API_KEY` (relay token). See `docs/RUNTIME_REMOTE_MARIMO.md`. | `LIQUID_API_URL`, `LIQUID_API_KEY` |
+| `run-remote-rollout.sh [rollout args]` | **This branch only:** headless version of the above, JSON report, no viewer. Requires `LIQUID_API_KEY` (relay token). | `LIQUID_API_URL`, `LIQUID_API_KEY` |
 | `train_tmux.sh <task> [contact-train args]` | training in tmux session `train` (task is required) | `SESSION` |
 | `watch_tmux.sh [run] [contact-watch args]` | checkpoint watcher (default run: `latest`) | `SESSION` |
 | `eval.sh [selector] [contact-eval args]` | one-off episodes eval + video (default `best`) | `TASK`, `NUM_ENVS` (256) |

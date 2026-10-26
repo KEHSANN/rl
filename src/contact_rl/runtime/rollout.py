@@ -106,7 +106,12 @@ def main(argv=None) -> None:
   ap.add_argument("--checkpoint", default="best")
   ap.add_argument("--run-root", default="runs")
   ap.add_argument("--device", default="cuda:0")
-  ap.add_argument("--decider", choices=("liquid", "mock"), default="liquid")
+  ap.add_argument("--decider", choices=("liquid", "mock", "remote"), default="liquid")
+  ap.add_argument("--api-url", default="http://127.0.0.1:8001",
+                  help="model server base URL for --decider remote")
+  ap.add_argument("--api-timeout", type=float, default=1.8,
+                  help="HTTP timeout in seconds; keep below --deadline-s (default 2.0)")
+  ap.add_argument("--api-key", default=None, help="Bearer token (prefer LIQUID_API_KEY)")
   ap.add_argument("--model", default="LiquidAI/d1-3B-w8a8")
   ap.add_argument("--model-device", default="cuda")
   ap.add_argument("--instruction", default="Move toward the target and turn left.")
@@ -152,6 +157,12 @@ def main(argv=None) -> None:
   if a.decider == "liquid":
     dec = LiquidDecider(a.model, a.model_device, True)
     rt = LiquidRuntime(lambda lim: dec.make_decide(lim, cl.turn_rate, cl), dec.load, limits, mode="closed_loop",
+                       closed_loop=cl)
+  elif a.decider == "remote":
+    from contact_rl.runtime.remote_decider import RemoteDecider
+
+    dec = RemoteDecider(a.api_url, api_key=a.api_key, timeout_s=a.api_timeout)
+    rt = LiquidRuntime(lambda lim: make_decide(dec.ask, lim, cl.turn_rate, cl), dec.load, limits, mode="closed_loop",
                        closed_loop=cl)
   else:
     rt = LiquidRuntime(lambda lim: make_decide(mock_ask, lim, cl.turn_rate, cl), None, limits, mode="closed_loop",
@@ -221,8 +232,9 @@ def main(argv=None) -> None:
                              and interfaces["action_shape_start"] == interfaces["action_shape_end"]
                              and interfaces["policy_hidden_start"] == interfaces["policy_hidden_end"])
   rep = {
-    "decider": a.decider if a.decider == "liquid" else "MOCK system_one stub (not the Liquid model)",
-    "model": a.model if a.decider == "liquid" else None,
+    "decider": a.decider if a.decider in ("liquid", "remote")
+             else "MOCK system_one stub (not the Liquid model)",
+    "model": a.model if a.decider == "liquid" else (a.api_url if a.decider == "remote" else None),
     "load_report": rt.loop.load_report, "load_wait_s": round(load_s, 2),
     "checkpoint": str(ckpt), "sim_device": a.device, "instruction": a.instruction, "target_rel": a.target,
     "sim_seconds": round(rt.sim_time, 2), "wall_seconds": round(wall, 2),

@@ -1,8 +1,11 @@
-# runtime-only branch (vps-runtime-only), from feature/liquid-ai-runtime.
-# Install with scripts/vps/setup-runtime.sh, NOT scripts/vps/setup.sh.
-# That script re-runs `uv lock` (the committed uv.lock is the full-branch
-# lock) and syncs without mjlab[train]: no wandb, no tensorboard, no
-# torchrunx. See docs/VPS_RUNTIME_ONLY.md for what stays and what breaks.
+# runtime-only + remote-model branch (runtime-remote-marimo), from
+# vps-runtime-only (4119b94). Install with scripts/vps/setup-runtime.sh,
+# NOT scripts/vps/setup.sh. That script re-runs `uv lock` (the committed
+# uv.lock is the full-branch lock) and syncs without mjlab[train]: no
+# wandb, no tensorboard, no torchrunx, no contact-train. The Liquid model
+# is NOT installed here either: it runs on molab and is asked over HTTP
+# (see docs/RUNTIME_REMOTE_MARIMO.md). See docs/VPS_RUNTIME_ONLY.md for
+# what stays and what breaks.
 # contact-rl
 #
 # Implementation of "Learning to Act Through Contact: A Unified View of
