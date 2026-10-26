@@ -1,3 +1,8 @@
+# runtime-only branch (vps-runtime-only), from feature/liquid-ai-runtime.
+# Install with scripts/vps/setup-runtime.sh, NOT scripts/vps/setup.sh.
+# That script re-runs `uv lock` (the committed uv.lock is the full-branch
+# lock) and syncs without mjlab[train]: no wandb, no tensorboard, no
+# torchrunx. See docs/VPS_RUNTIME_ONLY.md for what stays and what breaks.
 # contact-rl
 #
 # Implementation of "Learning to Act Through Contact: A Unified View of
@@ -39,7 +44,8 @@ cpu = ["torch>=2.7.0"]
 # new checkpoints of a running job in a separate process; contact-doctor:
 # machine-readiness checks; contact-bench: hardware + env-throughput sweep
 # (see src/contact_rl/scripts/).
-contact-train = "contact_rl.scripts.train:main"
+# runtime-only branch: contact-train is intentionally NOT installed here.
+# Train on feature/liquid-ai-runtime (scripts/vps/setup.sh), not on this branch.
 contact-play = "contact_rl.scripts.play:main"
 contact-eval = "contact_rl.scripts.evaluate:main"
 contact-watch = "contact_rl.scripts.watch:main"

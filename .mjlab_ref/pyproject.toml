@@ -35,7 +35,6 @@ dependencies = [
   "tqdm",
   "tyro>=1.0.1",
   "torch>=2.7.0",
-  "torchrunx>=0.3.4",
   "warp-lang>=1.12.0",
   "mujoco-warp>=3.5.0",
   "mujoco>=3.5.0",
@@ -46,8 +45,23 @@ dependencies = [
   "imageio-ffmpeg",
   "tensordict",
   "rsl-rl-lib==5.0.1",
-  "tensorboard>=2.20.0",
+  # NOTE (runtime-only branch): onnxscript is kept in the base set.
+  # Removing it here alone would not remove it from a sync anyway:
+  # rsl-rl-lib declares onnx + onnxscript itself, and mjlab's
+  # exporter_utils imports onnx at module level (see the train list below
+  # for what is actually dropped). It is never imported by
+  # contact-play / contact-eval / rollout on its own.
   "onnxscript>=0.5.4",
+]
+
+[project.optional-dependencies]
+# Training / logging only. contact-play, contact-eval, contact-watch,
+# contact-doctor, contact-bench and the Liquid rollout never call learn(),
+# so the rsl-rl TensorBoard/W&B writer is never created on this branch.
+# Request it on the full branch with: mjlab[train]
+train = [
+  "torchrunx>=0.3.4",
+  "tensorboard>=2.20.0",
   "wandb>=0.22.3",
 ]
 

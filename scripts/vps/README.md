@@ -7,6 +7,7 @@ Linux x86_64 + NVIDIA, no Docker. All scripts `source common.sh`, which `cd`s to
 | Script | What it does | Knobs |
 |---|---|---|
 | `setup.sh [doctor args]` | `uv sync --extra cu128 --python 3.12 --frozen`, then `contact-doctor` | `EXTRA=cpu` |
+| `setup-runtime.sh [doctor args]` | **Runtime-only branch only:** `uv lock` + `uv sync --extra cu128`, then `contact-doctor`. No wandb / tensorboard / torchrunx, no `contact-train`. See `docs/VPS_RUNTIME_ONLY.md`. | `EXTRA=cpu` |
 | `train_tmux.sh <task> [contact-train args]` | training in tmux session `train` (task is required) | `SESSION` |
 | `watch_tmux.sh [run] [contact-watch args]` | checkpoint watcher (default run: `latest`) | `SESSION` |
 | `eval.sh [selector] [contact-eval args]` | one-off episodes eval + video (default `best`) | `TASK`, `NUM_ENVS` (256) |
